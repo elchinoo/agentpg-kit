@@ -13,6 +13,10 @@ DEFAULT_CSP = (b"default-src 'none'; script-src 'self'; style-src 'self'; img-sr
                b"base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
 
 
+class _TooLarge(Exception):
+    pass
+
+
 class SecurityGuard:
     def __init__(self, app, *, csrf_header: str, csrf_prefixes: tuple[str, ...] = ("/api/",), body_prefixes: tuple[str, ...] = ("/api/",),
                  max_body: int = 64 * 1024, csp: bytes = DEFAULT_CSP, observe: Callable[[str, str, int, float], None] | None = None,
@@ -46,15 +50,33 @@ class SecurityGuard:
               and not headers.get("authorization") and not headers.get(self.csrf_header)):
             await reject(403, "missing CSRF header")
         else:
+            begun = {"v": False}
+            counted = {"n": 0}
+            capped = path.startswith(self.body_prefixes)
+
+            async def limited_receive():
+                msg = await receive()
+                if capped and msg["type"] == "http.request":       # chunked bodies have no Content-Length to check up front
+                    counted["n"] += len(msg.get("body", b""))
+                    if counted["n"] > self.max_body:
+                        raise _TooLarge
+                return msg
+
             async def wrapped(msg):
                 if msg["type"] == "http.response.start":
+                    begun["v"] = True
                     status["code"] = msg["status"]
                     have = {h[0].lower() for h in msg["headers"]}
                     msg["headers"] = list(msg["headers"]) + [h for h in self._headers() if h[0] not in have]
                     if b"cache-control" not in have:
                         msg["headers"].append((b"cache-control", b"no-store"))
                 await send(msg)
-            await self.app(scope, receive, wrapped)
+            try:
+                await self.app(scope, limited_receive, wrapped)
+            except _TooLarge:
+                if begun["v"]:
+                    raise
+                await reject(413, "request body too large")
         if self.observe:
             route = getattr(scope.get("route"), "path", None) or ("/mcp" if path.startswith("/mcp") else "other")
             if route != self.skip:

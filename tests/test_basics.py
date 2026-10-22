@@ -156,3 +156,57 @@ def test_metrics_family_names_and_db_collector():
     n = Metrics("demo", "1")
     n.add_db_collector(boom)
     assert 'db_up{app="demo"} 0.0' in n.render()[0].decode()    # a scrape never fails because the database is down
+
+
+# ---- v0.2 ----------------------------------------------------------------------------------------------------
+def test_guard_caps_chunked_bodies_without_content_length():
+    from fastapi import Request
+
+    app = FastAPI()
+
+    @app.post("/api/echo")
+    async def echo(request: Request):
+        return {"n": len(await request.body())}
+
+    app.add_middleware(SecurityGuard, csrf_header="X-Test-CSRF", max_body=100, csrf_prefixes=())
+    c = TestClient(app)
+
+    def chunks(n):
+        yield b"x" * n
+        yield b"x" * n
+
+    assert c.post("/api/echo", content=chunks(40)).json() == {"n": 80}
+    r = c.post("/api/echo", content=chunks(60))                     # generator body: sent chunked, no Content-Length
+    assert r.status_code == 413 and r.json()["detail"] == "request body too large"
+
+
+def test_llm_client_reads_the_answer_bounded_and_types_its_errors(monkeypatch):
+    import httpx
+
+    from apgkit import llm
+    from apgkit.llm import LLMClient, LLMError, LLMTimeout, LLMUnreachable
+
+    guard = NetGuard("KIT_TEST_ALLOW")
+    monkeypatch.setattr(guard, "check", lambda u: u)
+
+    def client_for(handler):
+        return LLMClient(guard, http_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)))
+
+    ok = client_for(lambda r: httpx.Response(200, json={"a": 1})).post_json("https://x.example", "/p", "k", {}, trusted=False)
+    assert ok.json() == {"a": 1}
+    monkeypatch.setattr(llm, "MAX_RESPONSE_BYTES", 10)
+    with pytest.raises(LLMError, match="too large"):
+        client_for(lambda r: httpx.Response(200, content=b"y" * 50)).post_json("https://x.example", "/p", "k", {}, trusted=False)
+    monkeypatch.setattr(llm.time, "sleep", lambda s: None)
+
+    def timeout(r):
+        raise httpx.ReadTimeout("slow", request=r)
+
+    def refused(r):
+        raise httpx.ConnectError("no", request=r)
+
+    with pytest.raises(LLMTimeout):
+        client_for(timeout).post_json("https://x.example", "/p", "k", {}, trusted=False, retries=1)
+    with pytest.raises(LLMUnreachable):
+        client_for(refused).post_json("https://x.example", "/p", "k", {}, trusted=False, retries=1)
+    assert issubclass(LLMTimeout, LLMError) and issubclass(LLMUnreachable, LLMError)

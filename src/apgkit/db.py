@@ -24,8 +24,11 @@ def _register_vector(conn: psycopg.Connection) -> None:
 
 
 class Database:
-    def __init__(self, url: Callable[[], str] = database_url, *, vector: bool = False, pool_max: int = 20):
-        self._url, self.vector, self.pool_max = url, vector, pool_max
+    def __init__(self, url: Callable[[], str] = database_url, *, vector: bool = False, pool_max: int = 20, pool_wait: bool = True):
+        """`pool_wait=False` opens the pool without waiting for its first connections (it fills in the background) and checks
+        connections out with a short timeout: a request that arrives while a scaled-to-zero database wakes fails fast with a
+        503-able error instead of blocking for up to 30 s."""
+        self._url, self.vector, self.pool_max, self.pool_wait = url, vector, pool_max, pool_wait
         self._pool: ConnectionPool | None = None
         self._lock = threading.Lock()
 
@@ -54,7 +57,7 @@ class Database:
                     conn.commit()
                 self._pool = ConnectionPool(self._url(), min_size=2, max_size=self.pool_max, open=False, timeout=5,
                                             kwargs={"row_factory": dict_row, "connect_timeout": 10}, configure=configure)
-                self._pool.open(wait=True, timeout=30)
+                self._pool.open(wait=self.pool_wait, timeout=30)
             return self._pool
 
     def close_pool(self) -> None:

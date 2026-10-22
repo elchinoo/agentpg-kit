@@ -5,6 +5,7 @@ from conftest import needs_db
 from apgkit import migrate, settings_store
 from apgkit.auth import AppAuth, LocalAuth
 from apgkit.auth.schema import SQL as AUTH_SQL
+from apgkit.db import Database
 from apgkit.vault import Vault, VaultError, VaultLocked
 
 pytestmark = needs_db
@@ -189,3 +190,45 @@ def test_vault_can_start_from_the_platform_secret_alone(db, tmp_path, monkeypatc
         c.commit()
         v.lock()
         assert v.unlock_with_password(c, "a password added later") and v.decrypt(token) == "sk-secret"
+
+
+# ---- v0.2 ----------------------------------------------------------------------------------------------------
+@needs_db
+def test_a_non_waiting_pool_opens_without_blocking(db):
+    import time
+
+    lazy = Database(pool_wait=False)
+    t = time.monotonic()
+    pool = lazy.pool()
+    assert time.monotonic() - t < 5
+    with pool.connection() as conn:
+        assert conn.execute("SELECT 1 AS one").fetchone()["one"] == 1
+    lazy.close_pool()
+
+
+@needs_db
+def test_authenticator_static_tokens_cache_and_public_resolver(db):
+    import hmac  # noqa: F401
+
+    from apgkit.auth import AppAuth, Authenticator, LocalAuth, Principal
+    from apgkit.auth.schema import SQL
+
+    with db.connect() as c:
+        c.execute("CREATE TABLE IF NOT EXISTS app_setting (key text PRIMARY KEY, value text NOT NULL)")
+        c.execute(SQL)
+        c.commit()
+    app = AppAuth("t", "t", {}, {"read": frozenset({"x:read"})})
+    local = LocalAuth(app, env_prefix="KITT", token_prefix="kt_", token_scopes={"read"})
+    metrics_p = Principal("static", "metrics-token", frozenset({"metrics:scrape"}))
+    auth = Authenticator(app, local, db, cookie_name="c", static_tokens=[(lambda: "scrape-secret", metrics_p), (lambda: "", metrics_p)],
+                         token_cache_seconds=60)
+    assert auth.resolve_bearer("scrape-secret") == metrics_p and auth.resolve_bearer("nope") is None and auth.resolve_bearer("") is None
+    with db.connect() as c:
+        tid, raw = local.create_token(c, "ro", "read")
+    p = auth.resolve_bearer(raw)
+    assert p and p.can("x:read")
+    with db.connect() as c:
+        local.revoke_token(c, tid)
+    assert auth.resolve_bearer(raw) is not None                    # cached for this process
+    auth.forget_tokens()
+    assert auth.resolve_bearer(raw) is None

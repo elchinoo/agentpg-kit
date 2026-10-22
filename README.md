@@ -40,7 +40,7 @@ def things(): ...
 
 ## Install
 
-Apps pin a release: `pip install "agentpg-kit @ https://github.com/elchinoo/agentpg-kit/archive/refs/tags/v0.1.0.tar.gz"`.
+Apps pin a release: `pip install "agentpg-kit @ https://github.com/elchinoo/agentpg-kit/archive/refs/tags/v0.2.0.tar.gz"`.
 For local development put this repository next to the app and use `uv pip install -e ../agentpg-kit`.
 
 ## Tests

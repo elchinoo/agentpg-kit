@@ -20,6 +20,14 @@ class LLMError(RuntimeError):
     """A failure whose message is safe to show to users: it never contains the API key."""
 
 
+class LLMTimeout(LLMError):
+    """The provider did not answer in time."""
+
+
+class LLMUnreachable(LLMError):
+    """The provider could not be reached (DNS, connection refused, TLS...)."""
+
+
 @dataclass(frozen=True)
 class ChatConfig:
     base_url: str
@@ -47,6 +55,21 @@ class LLMClient:
         self.guard, self.vault = guard, vault
         self._http = http_factory or (lambda: httpx.Client(timeout=60, follow_redirects=False))
 
+    @staticmethod
+    def _bounded_post(client: httpx.Client, url: str, headers: dict, body: dict) -> httpx.Response:
+        """POST and read the answer in chunks, refusing it as soon as it passes MAX_RESPONSE_BYTES (a hostile provider cannot make us
+        buffer an unbounded body)."""
+        with client.stream("POST", url, headers=headers, json=body) as r:
+            if r.is_redirect:
+                return r
+            data = bytearray()
+            for chunk in r.iter_bytes():
+                data += chunk
+                if len(data) > MAX_RESPONSE_BYTES:
+                    raise LLMError("provider response too large")
+            kept = {k: v for k, v in r.headers.items() if k.lower() not in {"content-encoding", "content-length", "transfer-encoding"}}
+            return httpx.Response(r.status_code, headers=kept, content=bytes(data), request=r.request)
+
     def post_json(self, base_url: str, path: str, api_key: str, body: dict, *, trusted: bool, retries: int = 3) -> httpx.Response:
         if not trusted:
             try:
@@ -58,15 +81,16 @@ class LLMClient:
         with self._http() as client:
             for attempt in range(retries + 1):
                 try:
-                    resp = client.post(url, headers=headers, json=body)
+                    resp = self._bounded_post(client, url, headers, body)
+                except httpx.TimeoutException as exc:
+                    if attempt == retries:
+                        raise LLMTimeout("the provider did not answer in time") from exc
                 except httpx.TransportError as exc:
                     if attempt == retries:
-                        raise LLMError(f"could not reach the provider: {type(exc).__name__}") from exc
+                        raise LLMUnreachable(f"could not reach the provider: {type(exc).__name__}") from exc
                 else:
                     if resp.is_redirect:
                         raise LLMError("the provider URL redirected; use the final URL directly")
-                    if len(resp.content) > MAX_RESPONSE_BYTES:
-                        raise LLMError("provider response too large")
                     if resp.status_code not in _RETRY_STATUS or attempt == retries:
                         return resp
                 time.sleep(min(2**attempt, 8))

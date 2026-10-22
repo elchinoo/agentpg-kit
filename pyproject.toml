@@ -1,6 +1,6 @@
 [project]
 name = "agentpg-kit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Small reusable blocks for apps on AgentPG: config, Postgres, migrations, secrets vault, outbound-URL guard, LLM client, security middleware, metrics, MCP helper and federated (OIDC) authentication."
 requires-python = ">=3.11"
 license = "Apache-2.0"
