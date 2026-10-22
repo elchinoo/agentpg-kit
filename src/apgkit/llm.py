@@ -49,6 +49,48 @@ def redact(text: str, api_key: str) -> str:
     return text.replace(api_key, "***") if api_key else text
 
 
+def empty_answer_error(data: dict | None, max_tokens: int | None = None) -> LLMError:
+    """An actionable LLMError for a chat response that has no answer text.
+
+    Uses only the response's own metadata (`finish_reason`, `usage.completion_tokens`, whether the model produced
+    `reasoning_content`); the prompt and the API key never appear in the message.
+    """
+    data = data if isinstance(data, dict) else {}
+    try:
+        choice = data["choices"][0]
+        finish = choice.get("finish_reason")
+        message = choice.get("message") or {}
+    except (KeyError, IndexError, TypeError, AttributeError):
+        finish, message = None, {}
+    reasoning = message.get("reasoning_content") if isinstance(message, dict) else None
+    usage = data.get("usage")
+    used = usage.get("completion_tokens") if isinstance(usage, dict) else None
+    used = used if isinstance(used, int) and not isinstance(used, bool) else None
+    thinking = isinstance(reasoning, str) and bool(reasoning.strip())
+    details = ", ".join(x for x in (f"finish_reason={finish}" if finish else "",
+                                    f"completion_tokens={used}" if used is not None else "") if x)
+    if finish == "length" or thinking:
+        budget = used if used is not None else max_tokens
+        spent = f"all {budget} completion tokens" if budget is not None else "its whole completion token budget"
+        if thinking and finish != "length":
+            head = "the model produced only reasoning and no answer"
+        else:
+            head = f"the model used {spent} before answering"
+        return LLMError(f"{head} ({details or 'finish_reason=length'}): raise max tokens or use a model without a thinking phase")
+    return LLMError("the chat endpoint returned an empty answer" + (f" ({details})" if details else ""))
+
+
+def answer_text(data: dict, max_tokens: int | None = None) -> str:
+    """The stripped answer text of a chat-completions response, or a typed LLMError (see `empty_answer_error`)."""
+    try:
+        text = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise LLMError("unexpected response from the chat endpoint (no choices[0].message.content)") from exc
+    if not isinstance(text, str) or not text.strip():
+        raise empty_answer_error(data, max_tokens)
+    return text.strip()
+
+
 class LLMClient:
     def __init__(self, guard: NetGuard, vault: vault_mod.Vault | None = None,
                  http_factory: Callable[[], httpx.Client] | None = None):
@@ -109,9 +151,6 @@ class LLMClient:
             raise LLMError(f"chat endpoint returned HTTP {resp.status_code}: {redact(resp.text[:300], key)}")
         try:
             data = resp.json()
-            text = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
+        except ValueError as exc:
             raise LLMError("unexpected response from the chat endpoint (no choices[0].message.content)") from exc
-        if not isinstance(text, str) or not text.strip():
-            raise LLMError("the chat endpoint returned an empty answer")
-        return {"text": text.strip(), "usage": data.get("usage")}
+        return {"text": answer_text(data, max_tokens), "usage": data.get("usage") if isinstance(data, dict) else None}

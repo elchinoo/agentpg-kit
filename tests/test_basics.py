@@ -210,3 +210,41 @@ def test_llm_client_reads_the_answer_bounded_and_types_its_errors(monkeypatch):
     with pytest.raises(LLMUnreachable):
         client_for(refused).post_json("https://x.example", "/p", "k", {}, trusted=False, retries=1)
     assert issubclass(LLMTimeout, LLMError) and issubclass(LLMUnreachable, LLMError)
+
+
+def _chat_answer(payload, max_tokens=8):
+    import httpx
+
+    from apgkit.llm import ChatConfig, LLMClient
+
+    guard = NetGuard("KIT_TEST_ALLOW")
+    client = LLMClient(guard, http_factory=lambda: httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=payload))))
+    cfg = ChatConfig(base_url="https://x.example/v1", model="m", label="t", trusted=True, key_plain="sk-secret-key")  # pragma: allowlist secret
+    return client.chat(cfg, [{"role": "user", "content": "private prompt text"}], max_tokens=max_tokens)
+
+
+def test_empty_chat_answer_explains_a_thinking_model_that_ran_out_of_tokens():
+    from apgkit.llm import LLMError
+
+    payload = {"choices": [{"message": {"content": "", "reasoning_content": "Let me think..."}, "finish_reason": "length"}],
+               "usage": {"completion_tokens": 8}}
+    with pytest.raises(LLMError) as exc:
+        _chat_answer(payload)
+    msg = str(exc.value)
+    assert "all 8 completion tokens" in msg and "finish_reason=length" in msg and "raise max tokens" in msg
+    assert "private prompt" not in msg and "sk-secret" not in msg
+
+
+def test_empty_chat_answer_with_reasoning_only_and_without_metadata():
+    from apgkit.llm import LLMError
+
+    stopped = {"choices": [{"message": {"content": None, "reasoning_content": "hmm"}, "finish_reason": "stop"}], "usage": {"completion_tokens": 30}}
+    with pytest.raises(LLMError, match=r"only reasoning.*finish_reason=stop.*completion_tokens=30.*thinking phase"):
+        _chat_answer(stopped)
+    with pytest.raises(LLMError, match=r"all 8 completion tokens.*finish_reason=length"):
+        _chat_answer({"choices": [{"message": {"content": ""}, "finish_reason": "length"}]})
+    with pytest.raises(LLMError, match="returned an empty answer"):
+        _chat_answer({"choices": [{"message": {"content": "  "}}]})
+    with pytest.raises(LLMError, match="unexpected response"):
+        _chat_answer({"nothing": True})
+    assert _chat_answer({"choices": [{"message": {"content": " OK "}}], "usage": {"x": 1}})["text"] == "OK"
