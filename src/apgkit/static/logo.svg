@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="TrustDesk logo">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4f46e5"/>
+      <stop offset="1" stop-color="#0891b2"/>
+    </linearGradient>
+  </defs>
+  <path d="M32 3.5 56.5 12v18.2C56.5 45.2 46.5 56.4 32 60.5 17.5 56.4 7.5 45.2 7.5 30.2V12z" fill="url(#g)"/>
+  <path d="M32 3.5 56.5 12v18.2C56.5 45.2 46.5 56.4 32 60.5z" fill="#fff" fill-opacity=".12"/>
+  <rect x="19" y="19" width="26" height="4" rx="2" fill="#fff" fill-opacity=".55"/>
+  <rect x="19" y="27" width="17" height="4" rx="2" fill="#fff" fill-opacity=".55"/>
+  <path d="m23.5 40.5 6.5 6.5L45 31.5" fill="none" stroke="#fff" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
