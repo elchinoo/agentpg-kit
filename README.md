@@ -18,7 +18,7 @@ of the same vault, auth and middleware again. Import name: `apgkit`.
 An app declares **permissions** (`requests:decide`) and maps **roles** (given to people by the identity provider, namespaced
 `<app>:<role>` in tokens) and **scopes** (given to services, local API tokens and the static key) onto them. Code only asks
 `principal.can("requests:decide")`. The same `require(...)` works standalone (local admin password) and federated (tokens from
-the ecosystem [identity](https://github.com/elchinoo/agentpg-identity) provider, verified locally against its JWKS).
+the ecosystem [identity](https://github.com/elchinoo/identity) provider, verified locally against its JWKS).
 
 Verification is strict: RS256/ES256/EdDSA only (`none` and HMAC refused, which also closes key confusion), issuer, audience,
 expiry and not-before checked, unknown `kid` triggers one rate-limited JWKS refresh, roles of other apps are ignored.
