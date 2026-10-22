@@ -89,7 +89,7 @@ export function renderLogin(onDone, notice = "", product = "this app") {
         h("button", { class: "secondary", type: "submit" }, "Sign in with key"))));
     if (!s.password_login) children.push(err);
   }
-  box.replaceChildren(...children);
+  box.replaceChildren(...children.filter((c) => c != null && c !== false));   // replaceChildren would print null as the text "null"
   box.hidden = false;
   (s.password_login ? pw : $("login-key"))?.focus();
 }
