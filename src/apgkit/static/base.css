@@ -192,7 +192,11 @@ dialog .close { position: sticky; float: right; top: 0; z-index: 2; }
 .confirm-box { width: min(28rem, 100%); background: var(--surface); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); padding: 1.25rem; }
 .confirm-box h2 { margin: 0 0 .5rem; font-size: 1.1rem; }
 .confirm-msg { margin: 0 0 .75rem; white-space: pre-wrap; overflow-wrap: anywhere; }
-.confirm-box input[type=text] { width: 100%; margin: .25rem 0 .5rem; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: .5rem .7rem; }
+.confirm-box input:not([type=checkbox]) { width: 100%; margin: .25rem 0 .5rem; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: .5rem .7rem; }
+.confirm-box textarea { min-height: 6rem; }
+.confirm-box label { display: block; font-weight: 600; margin-bottom: .25rem; }
+.confirm-error { margin: 0 0 .5rem; min-height: 0; }
+.confirm-error:empty { display: none; }
 .confirm-box .btns { display: flex; justify-content: flex-end; }
 body.modal-open { overflow: hidden; }
 @media (prefers-reduced-motion: no-preference) { .confirm-box { animation: apg-pop .12s ease-out; } @keyframes apg-pop { from { opacity: 0; transform: scale(.97); } } }

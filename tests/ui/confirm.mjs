@@ -19,7 +19,7 @@ const body = new El("body");
 const main = new El("div"); body.append(main);
 globalThis.document = { body, createElement: (t) => new El(t), createTextNode: (d) => ({ nodeType: 3, data: d, text: () => String(d) }), getElementById: () => null };
 Object.defineProperty(document, "activeElement", { get: () => active });
-const { confirmDialog } = await import(new URL("../../src/apgkit/static/ui.js", import.meta.url).href);
+const { confirmDialog, promptDialog } = await import(new URL("../../src/apgkit/static/ui.js", import.meta.url).href);
 
 let bad = 0;
 const check = (ok, msg) => { if (!ok) { console.error("FAIL:", msg); bad++; } };
@@ -83,5 +83,61 @@ await tick();
 check(overlay()?.find((e) => e.id.startsWith("confirm-msg"))?.text() === "second", "second shown after the first closes");
 btn("Confirm").fire("click"); check(await b === true, "second resolves");
 
-console.log(bad ? "FAILED" : "ok: confirmDialog resolves, cancels, gates typeToConfirm, traps and restores focus, sets ARIA");
+// 6. promptDialog: value / null, required, validate gating, number bounds, password type, Enter / Escape, focus restore
+const field = () => overlay().find((e) => e.tag === "input" || e.tag === "textarea");
+const alertText = () => overlay().find((e) => e.attrs.role === "alert").text();
+const type = (v) => { field().value = v; field().fire("input"); };
+opener.focus();
+const ask = async (...a) => { p = promptDialog(...a); await tick(); };
+const enter = () => overlay().fire("keydown", { key: "Enter", target: field() });
+
+await ask("Reason?", { title: "Chargeback", label: "Reason", defaultValue: "disputed", required: true });
+check(field().value === "disputed" && active === field(), "prompt shows the default value and focuses the input");
+check(overlay().find((e) => e.tag === "label")?.text() === "Reason", "prompt has a visible label");
+check(overlay().find((e) => e.attrs.role === "alertdialog"), "prompt uses the same alertdialog");
+type("customer says no"); enter(); check(await p === "customer says no", "Enter submits the typed value");
+check(active === opener, "focus restored after prompt");
+
+await ask("m", { required: true });
+check(btn("OK").disabled, "required: empty input keeps OK disabled");
+type("   "); check(btn("OK").disabled, "required: blank input keeps OK disabled");
+enter(); check(overlay() !== null, "required: Enter does nothing while blank");
+type("x"); check(!btn("OK").disabled, "required: typing enables OK"); btn("OK").fire("click"); check(await p === "x", "OK click resolves the value");
+
+await ask("m", { defaultValue: "abc" }); overlay().fire("keydown", { key: "Escape", target: field() }); check(await p === null, "Escape resolves null");
+await ask("m"); btn("Cancel").fire("click"); check(await p === null, "Cancel resolves null");
+await ask("m"); overlay().fire("click", { target: overlay() }); check(await p === null, "backdrop resolves null");
+await ask("m"); btn("OK").fire("click"); check(await p === "", "optional empty prompt resolves an empty string");
+
+await ask("m", { validate: (v) => (v.length < 12 ? "Use at least 12 characters." : null), inputType: "password", confirmLabel: "Change" });
+check(field().attrs.type === "password" && field().attrs.autocomplete === "new-password", "password input type, never autocompleted");
+type("short"); check(btn("Change").disabled && alertText() === "Use at least 12 characters.", "validate error shown inline in role=alert and confirm disabled");
+check(!overlay().text().includes("short"), "the typed password is not echoed into the text");
+enter(); check(overlay() !== null, "Enter does nothing while invalid");
+type("long enough secret"); check(!btn("Change").disabled && alertText() === "", "valid value clears the error and enables confirm");
+btn("Change").fire("click"); check(await p === "long enough secret", "password value resolved as typed");
+
+await ask("Minutes", { inputType: "number", min: 0, max: 60, defaultValue: "10", required: true });
+check(field().attrs.type === "number" && field().attrs.min === "0" && field().attrs.max === "60", "number input carries min and max");
+check(!btn("OK").disabled, "the default 10 is valid");
+type("-1"); check(btn("OK").disabled && alertText() === "Must be at least 0.", "below min is rejected");
+type("61"); check(btn("OK").disabled && alertText() === "Must be at most 60.", "above max is rejected");
+type("abc"); check(btn("OK").disabled, "non-numeric is rejected");
+type(""); check(btn("OK").disabled, "required number: empty is rejected");
+type("0"); check(!btn("OK").disabled, "0 is within bounds"); enter(); check(await p === "0", "number resolves as a string");
+
+await ask("m", { multiline: true, defaultValue: "a" });
+check(field().tag === "textarea", "multiline renders a textarea");
+overlay().fire("keydown", { key: "Enter", target: field() }); check(overlay() !== null, "Enter in a textarea does not submit");
+overlay().fire("keydown", { key: "Enter", ctrlKey: true, target: field() }); check(await p === "a", "Ctrl+Enter submits a textarea");
+
+await ask("m", { defaultValue: "kept" });   // typed text survives an app re-render; a confirm queues behind an open prompt
+const firstPrompt = p;
+type("typed"); main.replaceChildren(new El("p")); check(field().value === "typed", "prompt text survives an app re-render");
+await show("queued confirm"); check(body.children.filter((c) => c.className === "confirm-overlay").length === 1, "a confirm queues behind an open prompt");
+const queued = p;
+btn("Cancel").fire("click"); check(await firstPrompt === null, "first prompt cancelled"); await tick();
+check(overlay()?.find((e) => e.id.startsWith("confirm-msg"))?.text() === "queued confirm", "the queued confirm shows next");
+btn("Confirm").fire("click"); check(await queued === true, "queued confirm resolves");
+console.log(bad ? "FAILED" : "ok: confirmDialog and promptDialog resolve, cancel, gates typeToConfirm, traps and restores focus, sets ARIA");
 process.exit(bad ? 1 : 0);

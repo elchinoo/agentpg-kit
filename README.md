@@ -57,9 +57,9 @@ const session = await bootSession(main);               // loading state, then er
 the content area is never blank after single sign-on. The vault unlock banner is built once and only shown or hidden, so a
 refresh never clears what is typed into it. Do the same in apps: update changed nodes, never rebuild one that holds input.
 
-### Confirmations: `confirmDialog`
+### Confirmations and prompts: `confirmDialog`, `promptDialog`
 
-Never call `window.confirm()`, `alert()` or `prompt()`: native dialogs cannot be styled and freeze automated browser tests
+Never call `window.confirm()`, `alert()` or `window.prompt()`: native dialogs cannot be styled and freeze automated browser tests
 (a kit test fails if shared JS uses them). Use the shared modal, and `toast()` for plain messages:
 
 ```js
@@ -75,6 +75,23 @@ button) and is trapped with Tab; Escape and a backdrop click cancel; Enter confi
 and not yet typed; focus returns to the opener; the page behind does not scroll (`body.modal-open`). With `typeToConfirm` the
 confirm button stays disabled until that exact phrase is typed. The dialog lives under `<body>`, so re-rendering the app
 never clears the typed phrase. Calls made while one is open queue. Message text is set with `textContent` only.
+
+```js
+import { promptDialog } from "/kit/ui.js";
+
+const reason = await promptDialog("Shown to analysts.", { title: "Chargeback", label: "Reason", required: true });   // string | null
+const mins = await promptDialog("Keep the old key working for how many minutes?", { inputType: "number", min: 0, max: 1440, defaultValue: "10", required: true });
+const pw = await promptDialog("New password for alice", { inputType: "password", validate: (v) => (v.length < 12 ? "Use at least 12 characters." : null) });
+if (pw === null) return;   // cancelled
+```
+
+`promptDialog(message, { title, label, defaultValue, placeholder, confirmLabel, cancelLabel, inputType, min, max, required, validate, multiline })`
+returns `Promise<string | null>`: the entered text as typed (numbers too, as a string), `null` on cancel, Escape or a backdrop click.
+It is the same modal (same ARIA, focus trap, queueing, restore). Enter submits a single-line input; in `multiline` (a textarea)
+Enter adds a line and Ctrl/Cmd+Enter submits. The confirm button stays disabled while the value is invalid: blank when
+`required`, outside `min`/`max` or not a number for `inputType: "number"`, or when `validate(value)` returns a message, which is
+shown inline (`role="alert"`). `inputType: "password"` renders a password field with `autocomplete="new-password"`; the value is
+only ever returned to the caller, never logged or written into the page text.
 
 ## Install
 
@@ -92,7 +109,8 @@ pytest -q
 
 ### 0.2.4
 - New: `confirmDialog()` in `ui.js` (+ `.confirm-*`, `button.danger-solid` styles): accessible promise-based replacement for `window.confirm()`, with optional type-to-confirm phrase. Reuses the existing `toast()` for messages.
-- Tests: confirm dialog fake-DOM test; a check that shared JS never calls `confirm`/`alert`/`prompt`.
+- New: `promptDialog()` in `ui.js`: replacement for `window.prompt()` on the same modal (text, password or number input, required, `validate()` with an inline error, multiline). Resolves a string, or `null` on cancel.
+- Tests: confirm and prompt dialog fake-DOM test; a check that shared JS never calls `confirm`/`alert`/`prompt`.
 
 ### 0.2.3
 - Fix: the vault unlock banner no longer loses typed text or focus when the session is refreshed.
