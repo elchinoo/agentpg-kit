@@ -1,5 +1,5 @@
 import { api } from "/kit/api.js";
-import { $, h, toast } from "/kit/ui.js";
+import { $, h, toast, loading, errorState } from "/kit/ui.js";
 
 export const state = { session: null, accounts: null };
 
@@ -12,6 +12,22 @@ export function can(permission) {
 export async function refreshSession() {
   state.session = await api("/api/session");
   return state.session;
+}
+
+// Load the session with a visible state in `container` (the app's content area): "Loading..." while the request is
+// in flight (after single sign-on this can take seconds), an error with a retry button if it fails. Resolves to the
+// session, or null after an error. The caller renders its own content afterwards, replacing the loading state.
+export async function bootSession(container, { text = "Loading\u2026", onReady } = {}) {
+  loading(container, text);
+  let session;
+  try {
+    session = await refreshSession();
+  } catch (ex) {
+    errorState(container, ex.message || "Could not load the session.", () => bootSession(container, { text, onReady }));
+    return null;
+  }
+  if (onReady) await onReady(session);
+  return session;
 }
 
 // ---- first-run setup ----------------------------------------------------------------------------
@@ -95,29 +111,34 @@ export function renderLogin(onDone, notice = "", product = "this app") {
 }
 
 // ---- vault unlock banner ------------------------------------------------------------------------
+// Built once and then only shown or hidden: the page refreshes the session on a timer, and rebuilding the form
+// would wipe a password the person is half way through typing and drop the focus. The input is never replaced.
 export function renderVaultBanner() {
   const b = $("vault-banner");
   const v = state.session?.vault;
   if (!v || !v.initialized || v.unlocked) { b.hidden = true; return; }
-  const pw = h("input", { id: "unlock-pw", type: "password", autocomplete: "current-password", placeholder: "Admin password", required: true });
-  const err = h("span", { class: "error" });
-  b.replaceChildren(
-    h("strong", {}, "Provider keys are locked."),
-    " The server restarted, so stored keys can't be used (external embeddings and Ask are paused) until you unlock them.",
-    h("form", {
-      class: "inline",
-      onsubmit: async (e) => {
-        e.preventDefault();
-        err.textContent = "";
-        try {
-          await api("/api/vault/unlock", { method: "POST", json: { password: pw.value } });
-          pw.value = "";
-          await refreshSession();
-          renderVaultBanner();
-          toast("Unlocked");
-          window.dispatchEvent(new CustomEvent("apg-unlocked"));
-        } catch (ex) { err.textContent = ex.status === 403 ? "Wrong password." : ex.message; }
-      },
-    }, pw, h("button", { class: "primary small", type: "submit" }, "Unlock"), err));
+  if (!b.dataset.built) {
+    const pw = h("input", { id: "unlock-pw", type: "password", autocomplete: "current-password", placeholder: "Admin password", required: true });
+    const err = h("span", { class: "error" });
+    b.replaceChildren(
+      h("strong", {}, "Provider keys are locked."),
+      " The server restarted, so stored keys can't be used (external embeddings and Ask are paused) until you unlock them.",
+      h("form", {
+        class: "inline",
+        onsubmit: async (e) => {
+          e.preventDefault();
+          err.textContent = "";
+          try {
+            await api("/api/vault/unlock", { method: "POST", json: { password: pw.value } });
+            pw.value = "";
+            await refreshSession();
+            renderVaultBanner();
+            toast("Unlocked");
+            window.dispatchEvent(new CustomEvent("apg-unlocked"));
+          } catch (ex) { err.textContent = ex.status === 403 ? "Wrong password." : ex.message; }
+        },
+      }, pw, h("button", { class: "primary small", type: "submit" }, "Unlock"), err));
+    b.dataset.built = "1";
+  }
   b.hidden = false;
 }

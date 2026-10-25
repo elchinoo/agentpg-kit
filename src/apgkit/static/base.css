@@ -177,4 +177,10 @@ dialog.window { width: min(72rem, 96vw); max-height: 94vh; overflow: auto; borde
 dialog.window.narrow-window { width: min(34rem, 96vw); background: var(--surface); }
 dialog.window::backdrop { background: rgb(10 12 28 / .55); }
 dialog .close { position: sticky; float: right; top: 0; z-index: 2; }
+.loading { display: flex; align-items: center; justify-content: center; gap: .75rem; padding: 3rem 1rem; color: var(--muted); }
+.spinner { width: 1.1rem; height: 1.1rem; border: 2px solid var(--line); border-top-color: var(--brand); border-radius: 50%; animation: apg-spin .8s linear infinite; }
+@keyframes apg-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
+.error-state { text-align: center; padding: 2.5rem 1rem; }
+.error-state button { margin-top: .5rem; }
 @media print { .top, .toast, #vault-banner, .btns { display: none !important; } body { background: #fff; color: #000; } .card { box-shadow: none; border-color: #bbb; } }

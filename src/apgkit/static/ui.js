@@ -58,6 +58,20 @@ export function fill(el, ...kids) {
   el.replaceChildren(...kids.flat().filter((k) => k != null && k !== false));
 }
 
+// Standard loading state: a status line with a spinner, so a content area is never blank while data is on its way.
+// Text goes through textContent; the spinner is CSS only (.loading in base.css, no inline style or script).
+export function loading(container, text = "Loading\u2026") {
+  fill(container, h("div", { class: "loading", role: "status", "aria-live": "polite" },
+    h("span", { class: "spinner", "aria-hidden": "true" }), h("span", { class: "loading-text" }, text)));
+}
+
+// Standard error state with a retry button. onRetry is optional; without it only the message shows.
+export function errorState(container, message, onRetry) {
+  fill(container, h("div", { class: "error-state", role: "alert" },
+    h("p", { class: "error" }, message || "Something went wrong."),
+    onRetry ? h("button", { class: "secondary", type: "button", onclick: () => onRetry() }, "Try again") : null));
+}
+
 export const fmtDateTime = (s) => (s ? new Date(s).toLocaleString(undefined, { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "");
 
 // Plain dates (YYYY-MM-DD) have no time zone: never run them through Date(), which would shift them by a day.

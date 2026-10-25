@@ -38,6 +38,25 @@ auth = Authenticator(app_auth, local, db, cookie_name="ma_session", verifier=fed
 def things(): ...
 ```
 
+## Shared UI states
+
+Every app shell should show something while data is on its way and something actionable when it fails. All of it is plain
+DOM with `textContent` (strict CSP: no inline script or style):
+
+```js
+import { loading, errorState } from "/kit/ui.js";
+import { bootSession } from "/kit/session.js";
+
+loading(main, "Loading requests\u2026");               // spinner + status text (CSS class .loading)
+errorState(main, "Could not load.", () => load());     // message + "Try again" button (CSS class .error-state)
+
+const session = await bootSession(main);               // loading state, then error + retry if /api/session fails; null on error
+```
+
+`bootSession(container, { text, onReady })` is the session bootstrap: call it instead of `refreshSession()` at start-up so
+the content area is never blank after single sign-on. The vault unlock banner is built once and only shown or hidden, so a
+refresh never clears what is typed into it. Do the same in apps: update changed nodes, never rebuild one that holds input.
+
 ## Install
 
 Apps pin a release: `pip install "agentpg-kit @ https://github.com/elchinoo/agentpg-kit/archive/refs/tags/v0.2.0.tar.gz"`.
@@ -49,3 +68,10 @@ For local development put this repository next to the app and use `uv pip instal
 export TEST_DATABASE_URL=postgresql://...      # a throwaway database; the database tests drop its public schema
 pytest -q
 ```
+
+## Changelog
+
+### 0.2.3
+- Fix: the vault unlock banner no longer loses typed text or focus when the session is refreshed.
+- New: `loading()` and `errorState()` (with retry) in `ui.js`, `.loading` / `.error-state` styles, and `bootSession()` in `session.js` so the content area is never blank while the session loads.
+- Tests: node fake-DOM tests under `tests/ui`, run by pytest.

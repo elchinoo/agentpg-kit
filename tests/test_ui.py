@@ -1,0 +1,25 @@
+"""The shared UI's regression tests under tests/ui run in node against a tiny fake DOM (no browser, no server). Skipped without node."""
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+UI = Path(__file__).resolve().parent / "ui"
+STATIC = Path(__file__).resolve().parent.parent / "src" / "apgkit" / "static"
+SCRIPTS = sorted(p.name for p in UI.glob("*.mjs"))
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="needs node")
+@pytest.mark.parametrize("script", SCRIPTS)
+def test_ui_script(script):
+    out = subprocess.run(["node", str(UI / script)], capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert out.stdout.startswith("ok:")
+
+
+def test_the_shared_ui_never_builds_markup_from_strings():
+    for js in STATIC.glob("*.js"):
+        src = "\n".join(line.split("//")[0] for line in js.read_text().splitlines())   # comments may name the banned calls
+        for bad in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function"):
+            assert bad not in src, f"{js.name} uses {bad}"
