@@ -35,6 +35,69 @@ export function toast(msg, bad = false) {
   }, bad ? 8000 : 3500);
 }
 
+// Accessible replacement for window.confirm(): resolves true on confirm, false on cancel, Escape or a backdrop click.
+// Built once and appended to <body>, outside any app container, so an app re-render never wipes a typed phrase.
+// typeToConfirm (a string) shows an input and keeps the confirm button disabled until that exact phrase is typed.
+// Text goes through textContent; styling is CSS only (.confirm-* in base.css). One dialog at a time: later calls queue.
+let confirmQueue = Promise.resolve();
+let confirmSeq = 0;
+export function confirmDialog(message, { title = "Are you sure?", confirmLabel = "Confirm", cancelLabel = "Cancel", danger = false, typeToConfirm = "" } = {}) {
+  const run = () => new Promise((resolve) => {
+    const n = ++confirmSeq;
+    const opener = document.activeElement;
+    const phrase = typeToConfirm ? String(typeToConfirm) : "";
+    const cancelBtn = h("button", { class: "secondary", type: "button", id: `confirm-cancel-${n}` }, cancelLabel);
+    const okBtn = h("button", { class: danger ? "danger-solid" : "primary", type: "button", id: `confirm-ok-${n}` }, confirmLabel);
+    const input = phrase ? h("input", { type: "text", id: `confirm-phrase-${n}`, autocomplete: "off", spellcheck: "false", "aria-label": `Type ${phrase} to confirm` }) : null;
+    const ready = () => !phrase || input.value === phrase;
+    const sync = () => { okBtn.disabled = !ready(); };
+    const box = h("div", { class: "confirm-box", role: "alertdialog", "aria-modal": "true", "aria-labelledby": `confirm-title-${n}`, "aria-describedby": `confirm-msg-${n}` },
+      h("h2", { id: `confirm-title-${n}` }, title),
+      h("p", { id: `confirm-msg-${n}`, class: "confirm-msg" }, message),
+      phrase ? h("p", { class: "hint" }, "Type ", h("strong", {}, phrase), " to confirm.") : null,
+      input,
+      h("div", { class: "btns" }, cancelBtn, okBtn));
+    const overlay = h("div", { class: "confirm-overlay", popover: "manual" }, box);
+    let done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      try { overlay.hidePopover(); } catch { /* not shown as a popover */ }
+      overlay.remove?.();
+      document.body.classList.remove("modal-open");
+      if (opener && opener.focus) opener.focus();
+      resolve(value);
+    };
+    const attempt = () => { if (ready()) finish(true); };
+    cancelBtn.addEventListener("click", () => finish(false));
+    okBtn.addEventListener("click", attempt);
+    if (input) input.addEventListener("input", sync);
+    overlay.addEventListener("click", (e) => { if (e.target === overlay) finish(false); });
+    overlay.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { e.preventDefault?.(); finish(false); return; }
+      if (e.key === "Enter") {
+        e.preventDefault?.();
+        if (e.target === cancelBtn) finish(false); else attempt();
+        return;
+      }
+      if (e.key === "Tab") {   // trap: cycle through the enabled controls only
+        const order = [input, cancelBtn, okBtn].filter((x) => x && !x.disabled);
+        const i = order.indexOf(document.activeElement);
+        e.preventDefault?.();
+        order[(i + (e.shiftKey ? -1 : 1) + order.length) % order.length].focus();
+      }
+    });
+    sync();
+    document.body.append(overlay);
+    document.body.classList.add("modal-open");
+    try { overlay.showPopover(); } catch { /* popover API unavailable: plain fixed element */ }
+    (input || (danger ? cancelBtn : okBtn)).focus();
+  });
+  const result = confirmQueue.then(run);
+  confirmQueue = result.then(() => {}, () => {});
+  return result;
+}
+
 export async function copy(text, okMsg = "Copied") {
   try { await navigator.clipboard.writeText(text); toast(okMsg); } catch { toast("Copy failed", true); }
 }

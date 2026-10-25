@@ -57,6 +57,25 @@ const session = await bootSession(main);               // loading state, then er
 the content area is never blank after single sign-on. The vault unlock banner is built once and only shown or hidden, so a
 refresh never clears what is typed into it. Do the same in apps: update changed nodes, never rebuild one that holds input.
 
+### Confirmations: `confirmDialog`
+
+Never call `window.confirm()`, `alert()` or `prompt()`: native dialogs cannot be styled and freeze automated browser tests
+(a kit test fails if shared JS uses them). Use the shared modal, and `toast()` for plain messages:
+
+```js
+import { confirmDialog, toast } from "/kit/ui.js";
+
+if (!(await confirmDialog("Delete this request?", { title: "Delete request", confirmLabel: "Delete", danger: true }))) return;
+const ok = await confirmDialog("This erases every stored secret.", { danger: true, typeToConfirm: "ERASE", confirmLabel: "Erase vault" });
+```
+
+`confirmDialog(message, { title, confirmLabel, cancelLabel, danger, typeToConfirm })` returns `Promise<boolean>`. It renders
+`role="alertdialog"` with `aria-modal`, `aria-labelledby` and `aria-describedby`; focus moves in (to the input, else the safe
+button) and is trapped with Tab; Escape and a backdrop click cancel; Enter confirms unless a `typeToConfirm` phrase is required
+and not yet typed; focus returns to the opener; the page behind does not scroll (`body.modal-open`). With `typeToConfirm` the
+confirm button stays disabled until that exact phrase is typed. The dialog lives under `<body>`, so re-rendering the app
+never clears the typed phrase. Calls made while one is open queue. Message text is set with `textContent` only.
+
 ## Install
 
 Apps pin a release: `pip install "agentpg-kit @ https://github.com/elchinoo/agentpg-kit/archive/refs/tags/v0.2.0.tar.gz"`.
@@ -70,6 +89,10 @@ pytest -q
 ```
 
 ## Changelog
+
+### 0.2.4
+- New: `confirmDialog()` in `ui.js` (+ `.confirm-*`, `button.danger-solid` styles): accessible promise-based replacement for `window.confirm()`, with optional type-to-confirm phrase. Reuses the existing `toast()` for messages.
+- Tests: confirm dialog fake-DOM test; a check that shared JS never calls `confirm`/`alert`/`prompt`.
 
 ### 0.2.3
 - Fix: the vault unlock banner no longer loses typed text or focus when the session is refreshed.

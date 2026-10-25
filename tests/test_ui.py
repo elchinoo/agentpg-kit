@@ -23,3 +23,10 @@ def test_the_shared_ui_never_builds_markup_from_strings():
         src = "\n".join(line.split("//")[0] for line in js.read_text().splitlines())   # comments may name the banned calls
         for bad in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function"):
             assert bad not in src, f"{js.name} uses {bad}"
+
+
+def test_the_shared_ui_never_uses_native_dialogs():
+    import re
+    for js in STATIC.glob("*.js"):
+        src = "\n".join(line.split("//")[0] for line in js.read_text().splitlines())
+        assert not re.search(r"(?<![\w.])(window\.)?(confirm|alert|prompt)\s*\(", src.replace("confirmDialog(", "")), f"{js.name} calls a native dialog"

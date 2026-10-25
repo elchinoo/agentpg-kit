@@ -37,6 +37,9 @@ button.secondary:hover { border-color: var(--brand); }
 button.ghost { background: transparent; color: var(--muted); }
 button.ghost:hover { color: var(--text); }
 button.danger { background: transparent; color: var(--err); border-color: var(--line); }
+button.danger-solid { background: var(--err); color: #fff; font-weight: 600; }
+button.danger-solid:hover:not(:disabled) { filter: brightness(1.08); }
+button:disabled { opacity: .5; cursor: not-allowed; }
 button.small { padding: .25rem .6rem; font-size: .85rem; }
 button:disabled { opacity: .55; cursor: progress; }
 
@@ -183,4 +186,14 @@ dialog .close { position: sticky; float: right; top: 0; z-index: 2; }
 @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
 .error-state { text-align: center; padding: 2.5rem 1rem; }
 .error-state button { margin-top: .5rem; }
-@media print { .top, .toast, #vault-banner, .btns { display: none !important; } body { background: #fff; color: #000; } .card { box-shadow: none; border-color: #bbb; } }
+/* confirmDialog(): an overlay in the top layer (popover) so it also shows above an open <dialog> */
+.confirm-overlay { position: fixed; inset: 0; margin: 0; padding: 1rem; width: 100%; height: 100%; max-width: none; max-height: none; border: 0; background: rgb(10 12 28 / .55); color: var(--text); display: none; align-items: center; justify-content: center; overflow: auto; }
+.confirm-overlay:popover-open, .confirm-overlay:not([popover]) { display: flex; }
+.confirm-box { width: min(28rem, 100%); background: var(--surface); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); padding: 1.25rem; }
+.confirm-box h2 { margin: 0 0 .5rem; font-size: 1.1rem; }
+.confirm-msg { margin: 0 0 .75rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.confirm-box input[type=text] { width: 100%; margin: .25rem 0 .5rem; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: .5rem .7rem; }
+.confirm-box .btns { display: flex; justify-content: flex-end; }
+body.modal-open { overflow: hidden; }
+@media (prefers-reduced-motion: no-preference) { .confirm-box { animation: apg-pop .12s ease-out; } @keyframes apg-pop { from { opacity: 0; transform: scale(.97); } } }
+@media print { .top, .toast, .confirm-overlay, #vault-banner, .btns { display: none !important; } body { background: #fff; color: #000; } .card { box-shadow: none; border-color: #bbb; } }
