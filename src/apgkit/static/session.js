@@ -118,7 +118,7 @@ export function renderVaultBanner() {
   const v = state.session?.vault;
   if (!v || !v.initialized || v.unlocked) { b.hidden = true; return; }
   if (!b.dataset.built) {
-    const pw = h("input", { id: "unlock-pw", type: "password", autocomplete: "current-password", placeholder: "Admin password", required: true });
+    const pw = h("input", { id: "unlock-pw", type: "password", autocomplete: "current-password", placeholder: "Admin password", "aria-label": "Admin password", required: true });
     const err = h("span", { class: "error" });
     b.replaceChildren(
       h("strong", {}, "Provider keys are locked."),

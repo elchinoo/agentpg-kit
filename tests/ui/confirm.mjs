@@ -1,13 +1,23 @@
 // Regression: confirmDialog resolves true/false, Escape and backdrop cancel, typeToConfirm gates the button and survives a re-render,
-// focus returns to the opener, ARIA wiring and body scroll lock. Run: node tests/ui/confirm.mjs
+// focus returns to the opener, ARIA wiring and body scroll lock. The fake <dialog> models showModal/close/cancel and the browser's
+// rule that everything outside the topmost modal dialog is inert, so a confirmation that is not itself a modal dialog cannot be
+// clicked while an app's own modal <dialog> is open. Run: node tests/ui/confirm.mjs
 let active = null;
+const modals = [];   // open modal dialogs, last = topmost
+const inert = (el) => { const top = modals[modals.length - 1]; return !!top && !top.contains(el); };
 class El {
-  constructor(t) { this.tag = t; this.children = []; this.attrs = {}; this.listeners = {}; this.value = ""; this.disabled = false; this.textContent = ""; this.className = ""; this.parent = null; this.id = ""; this.classes = new Set(); this.classList = { add: (c) => this.classes.add(c), remove: (c) => this.classes.delete(c), contains: (c) => this.classes.has(c) }; }
+  constructor(t) { this.tag = t; this.children = []; this.attrs = {}; this.listeners = {}; this.value = ""; this.disabled = false; this.textContent = ""; this.className = ""; this.parent = null; this.id = ""; this.classes = new Set(); this.open = false; if (t === "dialog" && !globalThis.__noShowModal) this.showModal = () => { this.open = true; modals.push(this); this.setAttribute("open", ""); }; this.classList = { add: (c) => this.classes.add(c), remove: (c) => this.classes.delete(c), contains: (c) => this.classes.has(c) }; }
   get nodeType() { return 1; }
   append(...k) { for (const x of k) { if (x.parent !== undefined) x.parent = this; this.children.push(x); } }
   setAttribute(k, v) { this.attrs[k] = v; if (k === "id") this.id = v; }
   addEventListener(t, f) { this.listeners[t] = f; }
-  fire(t, ev = {}) { const e = { target: this, preventDefault() {}, ...ev }; let n = this; while (n) { if (n.listeners[t]) n.listeners[t](e); n = n.parent; } }
+  close() { this.open = false; const i = modals.indexOf(this); if (i >= 0) modals.splice(i, 1); }
+  fire(t, ev = {}) {
+    const e = { target: this, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...ev };
+    if (inert(e.target)) return e;   // the browser does not deliver input to anything outside the topmost modal dialog
+    let n = this; while (n) { if (n.listeners[t]) n.listeners[t](e); n = n.parent; }
+    return e;
+  }
   focus() { if (!this.disabled) active = this; }
   remove() { if (this.parent) this.parent.children = this.parent.children.filter((c) => c !== this); this.parent = null; if (active && !document.body.contains(active)) active = null; }
   contains(n) { return n === this || this.children.some((c) => c.contains && c.contains(n)); }
@@ -23,7 +33,9 @@ const { confirmDialog, promptDialog } = await import(new URL("../../src/apgkit/s
 
 let bad = 0;
 const check = (ok, msg) => { if (!ok) { console.error("FAIL:", msg); bad++; } };
-const overlay = () => body.find((e) => e.className === "confirm-overlay");
+const overlay = () => body.find((e) => e.attrs.role === "alertdialog");   // the dialog itself
+const dialogs = () => body.children.filter((c) => c.attrs.role === "alertdialog");
+const esc = (target) => { const e = overlay().fire("keydown", { key: "Escape", target }); if (!e.defaultPrevented && modals.length) modals[modals.length - 1].fire("cancel"); };   // keydown, then the native cancel
 const btn = (label) => overlay().find((e) => e.tag === "button" && e.text() === label);
 const opener = new El("button"); main.append(opener);
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -33,20 +45,22 @@ const show = async (...a) => { const pr = confirmDialog(...a); p = pr; await tic
 // 1. ARIA, focus in, scroll lock; confirm resolves true; focus restored
 opener.focus();
 await show("Delete <b>x</b>?", { title: "Delete", confirmLabel: "Delete it" });
-const box = overlay().find((e) => e.attrs.role === "alertdialog");
-check(box && box.attrs["aria-modal"] === "true", "role=alertdialog and aria-modal");
+const box = overlay();
+check(box.tag === "dialog" && box.open && modals.includes(box), "a native <dialog> opened with showModal()");
+check(box.parent === body, "the dialog is appended to <body>, outside the app container");
+check(box.attrs.role === "alertdialog" && box.attrs["aria-modal"] === "true", "role=alertdialog and aria-modal");
 check(overlay().find((e) => e.id === box.attrs["aria-labelledby"])?.text() === "Delete", "aria-labelledby points at the title");
 check(overlay().find((e) => e.id === box.attrs["aria-describedby"])?.text() === "Delete <b>x</b>?", "aria-describedby points at the message, as plain text");
 check(body.classes.has("modal-open"), "body scroll locked");
 check(active && overlay().contains(active) && active === btn("Delete it"), "focus moved into the dialog (confirm button)");
 btn("Delete it").fire("click");
 check(await p === true, "confirm resolves true");
-check(!overlay() && !body.classes.has("modal-open"), "dialog removed and scroll unlocked");
+check(!overlay() && !body.classes.has("modal-open") && modals.length === 0, "dialog closed and removed, scroll unlocked");
 check(active === opener, "focus returned to the opener");
 
 // 2. cancel button, Escape, backdrop resolve false
 await show("m"); btn("Cancel").fire("click"); check(await p === false, "cancel button resolves false");
-await show("m"); overlay().fire("keydown", { key: "Escape", target: btn("Confirm") }); check(await p === false, "Escape resolves false");
+await show("m"); esc(btn("Confirm")); check(await p === false, "Escape resolves false");
 check(active === opener, "focus restored after Escape");
 await show("m"); overlay().fire("click", { target: overlay() }); check(await p === false, "backdrop click resolves false");
 await show("m"); box.fire("click", { target: btn("Confirm") }); check(overlay() !== null, "a click inside the box does not close it"); btn("Cancel").fire("click"); await p;
@@ -77,7 +91,7 @@ overlay().fire("keydown", { key: "Enter", target: input }); check(await p === tr
 // 5. queued dialogs show one at a time
 await show("first"); const a = p; await show("second"); const b = p;
 await tick();
-check(body.children.filter((c) => c.className === "confirm-overlay").length === 1, "one dialog at a time");
+check(dialogs().length === 1, "one dialog at a time");
 btn("Cancel").fire("click"); check(await a === false, "first resolves");
 await tick();
 check(overlay()?.find((e) => e.id.startsWith("confirm-msg"))?.text() === "second", "second shown after the first closes");
@@ -94,7 +108,7 @@ const enter = () => overlay().fire("keydown", { key: "Enter", target: field() })
 await ask("Reason?", { title: "Chargeback", label: "Reason", defaultValue: "disputed", required: true });
 check(field().value === "disputed" && active === field(), "prompt shows the default value and focuses the input");
 check(overlay().find((e) => e.tag === "label")?.text() === "Reason", "prompt has a visible label");
-check(overlay().find((e) => e.attrs.role === "alertdialog"), "prompt uses the same alertdialog");
+check(overlay().tag === "dialog" && overlay().attrs.role === "alertdialog", "prompt uses the same native alertdialog");
 type("customer says no"); enter(); check(await p === "customer says no", "Enter submits the typed value");
 check(active === opener, "focus restored after prompt");
 
@@ -104,7 +118,7 @@ type("   "); check(btn("OK").disabled, "required: blank input keeps OK disabled"
 enter(); check(overlay() !== null, "required: Enter does nothing while blank");
 type("x"); check(!btn("OK").disabled, "required: typing enables OK"); btn("OK").fire("click"); check(await p === "x", "OK click resolves the value");
 
-await ask("m", { defaultValue: "abc" }); overlay().fire("keydown", { key: "Escape", target: field() }); check(await p === null, "Escape resolves null");
+await ask("m", { defaultValue: "abc" }); esc(field()); check(await p === null, "Escape resolves null");
 await ask("m"); btn("Cancel").fire("click"); check(await p === null, "Cancel resolves null");
 await ask("m"); overlay().fire("click", { target: overlay() }); check(await p === null, "backdrop resolves null");
 await ask("m"); btn("OK").fire("click"); check(await p === "", "optional empty prompt resolves an empty string");
@@ -134,10 +148,22 @@ overlay().fire("keydown", { key: "Enter", ctrlKey: true, target: field() }); che
 await ask("m", { defaultValue: "kept" });   // typed text survives an app re-render; a confirm queues behind an open prompt
 const firstPrompt = p;
 type("typed"); main.replaceChildren(new El("p")); check(field().value === "typed", "prompt text survives an app re-render");
-await show("queued confirm"); check(body.children.filter((c) => c.className === "confirm-overlay").length === 1, "a confirm queues behind an open prompt");
+await show("queued confirm"); check(dialogs().length === 1, "a confirm queues behind an open prompt");
 const queued = p;
 btn("Cancel").fire("click"); check(await firstPrompt === null, "first prompt cancelled"); await tick();
 check(overlay()?.find((e) => e.id.startsWith("confirm-msg"))?.text() === "queued confirm", "the queued confirm shows next");
 btn("Confirm").fire("click"); check(await queued === true, "queued confirm resolves");
+// 7. native Escape ('cancel' only, no keydown) resolves false once; the browser's own close is prevented
+await show("m"); { const d = overlay(); const e = d.fire("cancel"); check(e.defaultPrevented, "cancel default (close) is prevented, we close it ourselves"); check(await p === false, "native cancel resolves false"); check(modals.length === 0 && !overlay(), "closed after native cancel"); }
+await ask("m"); overlay().fire("cancel"); check(await p === null, "native cancel resolves a prompt to null");
+await show("m"); { const q = p; const d = overlay(); d.fire("cancel"); d.fire("cancel"); d.fire("keydown", { key: "Escape", target: d }); check(await q === false, "repeated Escape/cancel is handled once"); }
+
+// 9. no showModal() (older browsers): open attribute and a fixed overlay, same behaviour
+globalThis.__noShowModal = true;
+await show("fallback"); check(overlay().attrs.open === "" && overlay().classes.has("confirm-fallback") && modals.length === 0, "fallback sets open and the fixed-overlay class");
+overlay().fire("keydown", { key: "Escape", target: btn("Confirm") }); check(await p === false, "Escape works in the fallback");
+await show("fallback"); btn("Confirm").fire("click"); check(await p === true, "confirm works in the fallback");
+globalThis.__noShowModal = false;
+
 console.log(bad ? "FAILED" : "ok: confirmDialog and promptDialog resolve, cancel, gates typeToConfirm, traps and restores focus, sets ARIA");
 process.exit(bad ? 1 : 0);

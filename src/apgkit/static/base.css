@@ -1,13 +1,13 @@
 /* agentpg-kit shared look: tokens, layout, forms, tables, buttons, banners, toast. Apps add their own rules after this. */
 :root {
   --bg: #f6f7fb; --surface: #fff; --text: #14172b; --muted: #5d6480; --line: #e3e6f1;
-  --brand: #4f46e5; --brand-2: #0891b2; --brand-ink: #fff; --ok: #0f766e; --warn-bg: #fff7e6; --warn: #8a5300;
+  --brand: #4f46e5; --brand-2: #0891b2; --brand-ink: #fff; --ok: #0b6159; --alt: #0a6580; --warn-bg: #fff7e6; --warn: #8a5300;
   --err: #b42318; --code-bg: #0f1226; --code-text: #e8eaff; --shadow: 0 1px 2px rgb(20 23 43 / .06), 0 8px 24px rgb(20 23 43 / .06);
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #0d0f1c; --surface: #161a2e; --text: #eceefb; --muted: #9aa1c4; --line: #272c48;
-    --brand: #8b85ff; --brand-ink: #0d0f1c; --ok: #5eead4; --warn-bg: #2a2111; --warn: #fbbf64;
+    --brand: #8b85ff; --brand-ink: #0d0f1c; --ok: #5eead4; --alt: #67d4ee; --warn-bg: #2a2111; --warn: #fbbf64;
     --err: #ff8a80; --code-bg: #0a0c18; --shadow: 0 1px 2px rgb(0 0 0 / .4), 0 8px 24px rgb(0 0 0 / .35);
   }
 }
@@ -71,7 +71,7 @@ label { display: block; font-weight: 600; margin: 1rem 0 .3rem; }
 .result p.body { margin: 0 0 .8rem; white-space: pre-wrap; }
 .badges { display: flex; flex-wrap: wrap; gap: .4rem; align-items: center; }
 .badge { font-size: .78rem; font-weight: 600; padding: .15rem .55rem; border-radius: 999px; background: color-mix(in srgb, var(--brand) 13%, transparent); color: var(--brand); }
-.badge.alt { background: color-mix(in srgb, var(--brand-2) 15%, transparent); color: var(--brand-2); }
+.badge.alt { background: color-mix(in srgb, var(--brand-2) 15%, transparent); color: var(--alt); }
 .badge.plain { background: var(--bg); color: var(--muted); }
 .badges .spacer { flex: 1; }
 .empty { padding: 2rem 1rem; text-align: center; color: var(--muted); margin: 0; }
@@ -186,10 +186,14 @@ dialog .close { position: sticky; float: right; top: 0; z-index: 2; }
 @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
 .error-state { text-align: center; padding: 2.5rem 1rem; }
 .error-state button { margin-top: .5rem; }
-/* confirmDialog(): an overlay in the top layer (popover) so it also shows above an open <dialog> */
-.confirm-overlay { position: fixed; inset: 0; margin: 0; padding: 1rem; width: 100%; height: 100%; max-width: none; max-height: none; border: 0; background: rgb(10 12 28 / .55); color: var(--text); display: none; align-items: center; justify-content: center; overflow: auto; }
-.confirm-overlay:popover-open, .confirm-overlay:not([popover]) { display: flex; }
-.confirm-box { width: min(28rem, 100%); background: var(--surface); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); padding: 1.25rem; }
+/* confirmDialog(): a native <dialog> opened with showModal(). A modal dialog opened later stacks above an earlier modal
+   <dialog> (the earlier one becomes inert), so it works inside an app's own review window. */
+dialog.confirm-dialog { width: min(28rem, calc(100vw - 2rem)); max-width: none; max-height: calc(100vh - 2rem); margin: auto; padding: 0; border: 0; background: transparent; color: var(--text); overflow: visible; }
+dialog.confirm-dialog::backdrop { background: rgb(10 12 28 / .55); }
+/* Browsers without showModal(): the open attribute plus a fixed full-screen overlay */
+dialog.confirm-dialog.confirm-fallback { position: fixed; inset: 0; width: 100%; height: 100%; max-height: none; padding: 1rem; background: rgb(10 12 28 / .55); display: flex; align-items: center; justify-content: center; overflow: auto; z-index: 30; }
+dialog.confirm-dialog.confirm-fallback .confirm-box { width: min(28rem, 100%); }
+.confirm-box { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); padding: 1.25rem; }
 .confirm-box h2 { margin: 0 0 .5rem; font-size: 1.1rem; }
 .confirm-msg { margin: 0 0 .75rem; white-space: pre-wrap; overflow-wrap: anywhere; }
 .confirm-box input:not([type=checkbox]) { width: 100%; margin: .25rem 0 .5rem; font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: .5rem .7rem; }
@@ -200,4 +204,11 @@ dialog .close { position: sticky; float: right; top: 0; z-index: 2; }
 .confirm-box .btns { display: flex; justify-content: flex-end; }
 body.modal-open { overflow: hidden; }
 @media (prefers-reduced-motion: no-preference) { .confirm-box { animation: apg-pop .12s ease-out; } @keyframes apg-pop { from { opacity: 0; transform: scale(.97); } } }
-@media print { .top, .toast, .confirm-overlay, #vault-banner, .btns { display: none !important; } body { background: #fff; color: #000; } .card { box-shadow: none; border-color: #bbb; } }
+@media print { .top, .toast, dialog.confirm-dialog, #vault-banner, .btns { display: none !important; } body { background: #fff; color: #000; } .card { box-shadow: none; border-color: #bbb; } }
+
+/* ---- accessibility utilities ---- */
+/* Scrollable region: pair with ui.scrollRegion(el, label) so keyboard users can reach and scroll it */
+.scroll { overflow: auto; max-width: 100%; }
+.scroll:focus-visible { outline: 3px solid color-mix(in srgb, var(--brand) 55%, transparent); outline-offset: 2px; }
+/* Visually hidden, still read by screen readers: e.g. <th><span class="sr-only">Actions</span></th> */
+.sr-only { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }

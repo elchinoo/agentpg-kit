@@ -36,8 +36,10 @@ export function toast(msg, bad = false) {
 }
 
 // Accessible replacements for window.confirm() and window.prompt(), one shared modal.
-// Built once and appended to <body>, outside any app container, so an app re-render never wipes typed text.
-// Text goes through textContent; styling is CSS only (.confirm-* in base.css). One dialog at a time: later calls queue.
+// A native <dialog> opened with showModal() and appended to <body>, outside any app container, so an app re-render never wipes
+// typed text. A modal dialog opened later stacks above an earlier modal <dialog> (the earlier one turns inert), so the
+// confirmation also works inside an app's own review window. Text goes through textContent; styling is CSS only
+// (dialog.confirm-dialog in base.css). One dialog at a time: later calls queue.
 let modalQueue = Promise.resolve();
 let modalSeq = 0;
 function modal({ message, title, confirmLabel, cancelLabel, danger, field, ready, value, multiline = false }) {
@@ -53,19 +55,19 @@ function modal({ message, title, confirmLabel, cancelLabel, danger, field, ready
       okBtn.disabled = msg !== null && msg !== undefined;
       if (err) err.textContent = touched && msg ? msg : "";
     };
-    const box = h("div", { class: "confirm-box", role: "alertdialog", "aria-modal": "true", "aria-labelledby": `confirm-title-${n}`, "aria-describedby": `confirm-msg-${n}` },
-      h("h2", { id: `confirm-title-${n}` }, title),
-      h("p", { id: `confirm-msg-${n}`, class: "confirm-msg" }, message),
-      input ? input.wrap : null,
-      err,
-      h("div", { class: "btns" }, cancelBtn, okBtn));
-    const overlay = h("div", { class: "confirm-overlay", popover: "manual" }, box);
+    const dlg = h("dialog", { class: "confirm-dialog", role: "alertdialog", "aria-modal": "true", "aria-labelledby": `confirm-title-${n}`, "aria-describedby": `confirm-msg-${n}` },
+      h("div", { class: "confirm-box" },
+        h("h2", { id: `confirm-title-${n}` }, title),
+        h("p", { id: `confirm-msg-${n}`, class: "confirm-msg" }, message),
+        input ? input.wrap : null,
+        err,
+        h("div", { class: "btns" }, cancelBtn, okBtn)));
     let done = false;
     const finish = (result) => {
       if (done) return;
       done = true;
-      try { overlay.hidePopover(); } catch { /* not shown as a popover */ }
-      overlay.remove?.();
+      try { if (dlg.open) dlg.close(); } catch { /* already closed */ }
+      dlg.remove?.();
       document.body.classList.remove("modal-open");
       if (opener && opener.focus) opener.focus();
       resolve(result);
@@ -74,9 +76,10 @@ function modal({ message, title, confirmLabel, cancelLabel, danger, field, ready
     cancelBtn.addEventListener("click", () => finish(false));
     okBtn.addEventListener("click", attempt);
     if (input) input.addEventListener("input", () => sync(true));
-    overlay.addEventListener("click", (e) => { if (e.target === overlay) finish(false); });
-    overlay.addEventListener("keydown", (e) => {
-      if (e.key === "Escape") { e.preventDefault?.(); finish(false); return; }
+    dlg.addEventListener("click", (e) => { if (e.target === dlg) finish(false); });   // the dialog element itself is only ever hit on its backdrop
+    dlg.addEventListener("cancel", (e) => { e.preventDefault?.(); finish(false); });   // native Escape; the browser must not also close it
+    dlg.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { e.preventDefault?.(); finish(false); return; }   // also covers the no-showModal fallback
       if (e.key === "Enter") {
         if (multiline && input && e.target === input && !(e.ctrlKey || e.metaKey)) return;   // a new line, not a submit
         e.preventDefault?.();
@@ -91,9 +94,10 @@ function modal({ message, title, confirmLabel, cancelLabel, danger, field, ready
       }
     });
     sync(false);
-    document.body.append(overlay);
+    document.body.append(dlg);
     document.body.classList.add("modal-open");
-    try { overlay.showPopover(); } catch { /* popover API unavailable: plain fixed element */ }
+    if (typeof dlg.showModal === "function") dlg.showModal();
+    else { dlg.classList.add("confirm-fallback"); dlg.setAttribute("open", ""); }   // no showModal(): fixed overlay
     (input || (danger ? cancelBtn : okBtn)).focus();
   });
   const result = modalQueue.then(run);
@@ -139,6 +143,16 @@ export async function promptDialog(message, { title = "Enter a value", label = "
   };
   const res = await modal({ message, title, confirmLabel, cancelLabel, danger: false, field, ready, value: (input) => input.value, multiline: multiline && type !== "number" });
   return typeof res === "string" ? res : null;
+}
+
+// Make a scrolling container reachable by keyboard: a focusable named region (axe: scrollable-region-focusable).
+// Use on any element that can overflow, e.g. a wide table wrapper or a <pre>; the .scroll class sets overflow: auto.
+export function scrollRegion(el, label) {
+  el.classList.add("scroll");
+  el.setAttribute("tabindex", "0");
+  el.setAttribute("role", "region");
+  el.setAttribute("aria-label", label);
+  return el;
 }
 
 export async function copy(text, okMsg = "Copied") {

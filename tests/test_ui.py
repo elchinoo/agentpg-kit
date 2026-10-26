@@ -30,3 +30,16 @@ def test_the_shared_ui_never_uses_native_dialogs():
     for js in STATIC.glob("*.js"):
         src = "\n".join(line.split("//")[0] for line in js.read_text().splitlines())
         assert not re.search(r"(?<![\w.])(window\.)?(confirm|alert|prompt)\s*\(", src.replace("confirmDialog(", "")), f"{js.name} calls a native dialog"
+
+
+def test_every_kit_rendered_form_control_has_an_accessible_name():
+    import re
+    for js in (STATIC / "ui.js", STATIC / "session.js"):
+        src = js.read_text()
+        for m in re.finditer(r'h\("(input|select|textarea)",([^\n]*)', src):
+            line = m.group(2)
+            ident = re.search(r'id: "([\w-]+)"', line)
+            labelled = ident and f'for: "{ident.group(1)}"' in src
+            assert "aria-label" in line or "...props" in line or labelled, f"{js.name}: unnamed {m.group(1)}: {line[:60]}"
+    ui = (STATIC / "ui.js").read_text()
+    assert '"aria-label": label || title' in ui   # promptDialog's input is named even without a visible label

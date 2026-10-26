@@ -70,11 +70,13 @@ const ok = await confirmDialog("This erases every stored secret.", { danger: tru
 ```
 
 `confirmDialog(message, { title, confirmLabel, cancelLabel, danger, typeToConfirm })` returns `Promise<boolean>`. It renders
-`role="alertdialog"` with `aria-modal`, `aria-labelledby` and `aria-describedby`; focus moves in (to the input, else the safe
+a native `<dialog role="alertdialog">` opened with `showModal()` (with `aria-modal`, `aria-labelledby`, `aria-describedby`); focus moves in (to the input, else the safe
 button) and is trapped with Tab; Escape and a backdrop click cancel; Enter confirms unless a `typeToConfirm` phrase is required
 and not yet typed; focus returns to the opener; the page behind does not scroll (`body.modal-open`). With `typeToConfirm` the
 confirm button stays disabled until that exact phrase is typed. The dialog lives under `<body>`, so re-rendering the app
-never clears the typed phrase. Calls made while one is open queue. Message text is set with `textContent` only.
+never clears the typed phrase. Because it is a modal `<dialog>` itself, it also works above an app's own `showModal()` window
+(the app window becomes inert while it is up, and works again afterwards); browsers without `showModal()` get the `open`
+attribute and a fixed overlay (`.confirm-fallback`). Calls made while one is open queue. Message text is set with `textContent` only.
 
 ```js
 import { promptDialog } from "/kit/ui.js";
@@ -93,6 +95,25 @@ Enter adds a line and Ctrl/Cmd+Enter submits. The confirm button stays disabled 
 shown inline (`role="alert"`). `inputType: "password"` renders a password field with `autocomplete="new-password"`; the value is
 only ever returned to the caller, never logged or written into the page text.
 
+## Accessibility helpers
+
+```js
+import { scrollRegion } from "/kit/ui.js";
+scrollRegion(tableWrapper, "Recent payments");   // adds .scroll, tabindex="0", role="region", aria-label
+```
+
+- `.scroll` (CSS) sets `overflow: auto` and a focus ring. Give every container that can scroll (a wide table wrapper, a `<pre>`)
+  `scrollRegion(el, label)` so keyboard users can reach it (axe: `scrollable-region-focusable`). Existing `.card.flush` wrappers
+  that scroll: wrap with `scrollRegion(card, "...")`.
+- `.sr-only` hides text visually but keeps it for screen readers. Never ship an empty header cell: write
+  `<th><span class="sr-only">Actions</span></th>` (`h("th", {}, h("span", { class: "sr-only" }, "Actions"))`) for action columns and
+  the heatmap corner cell (axe: `empty-table-header`).
+- Controls need a name: use `field(label, input)` (a real `<label>`), or `aria-label` on a `<select>`/`<input>` that has no
+  visible label, e.g. `h("select", { "aria-label": `App for group ${name}` })` (axe: `select-name`).
+- Status badges (`.badge`, `.ok`, `.alt`, `.bad`, `.warn`, `.plain`) and status text meet WCAG AA (4.5:1) in light and dark; a test
+  (`tests/ui/contrast.mjs`) checks every pair. Apps defining their own badge colours should use `--ok`, `--alt`, `--err`, `--warn`
+  on `--surface`/`--bg`, which are AA-safe, instead of raw `--brand-2`.
+
 ## Install
 
 Apps pin a release: `pip install "agentpg-kit @ https://github.com/elchinoo/agentpg-kit/archive/refs/tags/v0.2.0.tar.gz"`.
@@ -106,6 +127,12 @@ pytest -q
 ```
 
 ## Changelog
+
+### 0.2.5
+- Fix: `confirmDialog()`/`promptDialog()` could not be clicked or typed into while an app had a modal `<dialog>` open via `showModal()` (PayBroker merchant window, ShopFront order window): the old `popover="manual"` overlay was inert there. The shared modal is now a native `<dialog role="alertdialog">` opened with `showModal()`, which stacks above an earlier modal dialog. Same API and behaviour (focus trap/restore, Escape and backdrop cancel, typeToConfirm, validation, queueing, scroll lock); fallback for browsers without `showModal()`. CSS: `.confirm-overlay` is replaced by `dialog.confirm-dialog` and its `::backdrop`; apps styling `.confirm-overlay` must update.
+- Accessibility: `.badge.ok` and `.badge.alt` text colours now reach 4.5:1 in light and dark (new `--alt` token, darker light `--ok`); the vault unlock input has an `aria-label`.
+- New: `scrollRegion(el, label)` in `ui.js` and the `.scroll` class (keyboard-reachable scrolling regions); `.sr-only` for visually hidden text (non-empty action column headers). Apps adopt them as described under "Accessibility helpers".
+- Tests: modal-in-modal regression (`confirm_in_modal.mjs`, fails on 0.2.4), native cancel and fallback cases, contrast test of the badge/status tokens, `scrollRegion` test, accessible-name check.
 
 ### 0.2.4
 - New: `confirmDialog()` in `ui.js` (+ `.confirm-*`, `button.danger-solid` styles): accessible promise-based replacement for `window.confirm()`, with optional type-to-confirm phrase. Reuses the existing `toast()` for messages.
