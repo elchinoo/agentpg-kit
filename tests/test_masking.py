@@ -17,7 +17,7 @@ COLUMNS = {"id": "pass", "name": "initial", "email": "email", "card_last4": "las
 def roles(db):
     with db.connect() as c:
         c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='a1p_readonly') THEN CREATE ROLE a1p_readonly NOLOGIN; END IF; END $$")
-        c.execute(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='{LOGIN}') THEN CREATE ROLE {LOGIN} LOGIN; END IF; END $$")
+        c.execute(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='{LOGIN}') THEN CREATE ROLE {LOGIN} LOGIN PASSWORD 'ro-pw-test'; END IF; END $$")
         c.execute(f"GRANT a1p_readonly TO {LOGIN}")
         c.commit()
 
@@ -32,7 +32,7 @@ def _table(db, grant=True):
 
 
 def _ro():
-    return psycopg.connect(make_conninfo(TEST_URL, user=LOGIN), row_factory=dict_row, autocommit=True)
+    return psycopg.connect(make_conninfo(TEST_URL, user=LOGIN, password="ro-pw-test"), row_factory=dict_row, autocommit=True)
 
 
 def _mask(c, **kw):
@@ -104,11 +104,11 @@ def test_missing_role_is_skipped_quietly(db, caplog):
 def test_non_owner_revoke_is_reported_not_assumed(db, roles):
     _table(db)
     with db.connect() as c:
-        c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='kit_not_owner') THEN CREATE ROLE kit_not_owner LOGIN; END IF; END $$")
+        c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='kit_not_owner') THEN CREATE ROLE kit_not_owner LOGIN PASSWORD 'ro-pw-test'; END IF; END $$")
         c.execute("GRANT USAGE, CREATE ON SCHEMA public TO kit_not_owner")
         c.execute("GRANT SELECT ON customer TO kit_not_owner")
         c.commit()
-    with psycopg.connect(make_conninfo(TEST_URL, user="kit_not_owner"), row_factory=dict_row) as c:
+    with psycopg.connect(make_conninfo(TEST_URL, user="kit_not_owner", password="ro-pw-test"), row_factory=dict_row) as c:
         res = masking.mask_view(c, "customer", "customer_masked", {"id": "pass"})        # can create a view but is not the owner
     assert res["applied"] is False and res["base_denied"] is False and "still readable" in res["reason"]
 

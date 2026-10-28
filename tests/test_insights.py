@@ -115,12 +115,12 @@ def test_tuner_and_advisor(db):
 def test_unreadable_source_is_reported_not_raised(db):
     login = "kit_insights_login"
     with _conn(db, FAKE_ESM + FAKE_TUNER) as c:
-        c.execute(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='{login}') THEN CREATE ROLE {login} LOGIN; END IF; END $$")
+        c.execute(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='{login}') THEN CREATE ROLE {login} LOGIN PASSWORD 'ro-pw-test'; END IF; END $$")
         c.execute(f"GRANT USAGE ON SCHEMA public TO {login}")
         c.execute(f"REVOKE ALL ON edb_stat_monitor FROM PUBLIC, {login}")
         c.execute("REVOKE ALL ON FUNCTION edb_pg_tuner_recommendations() FROM PUBLIC")
         c.commit()
-    with psycopg.connect(make_conninfo(TEST_URL, user=login), row_factory=psycopg.rows.dict_row) as lc:
+    with psycopg.connect(make_conninfo(TEST_URL, user=login, password="ro-pw-test"), row_factory=psycopg.rows.dict_row) as lc:
         s = insights.sources(lc)
         assert s["edb_stat_monitor"] == {"available": False, "reason": "permission denied for this database role"}
         assert insights.top_queries(lc)["available"] is False
