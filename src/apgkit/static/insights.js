@@ -45,7 +45,7 @@ export function topQueriesBlock(part, state, rerender) {
   return h("section", { class: "card insights-block" },
     h("h2", {}, "Top queries"),
     h("p", { class: "hint" }, `From ${part.source}${part.since ? `, since ${new Date(part.since).toLocaleString()}` : ""}. Statement text is normalised: values are not shown.`),
-    part.text_hidden ? h("p", { class: "hint insights-hidden" }, `${part.text_hidden} statement texts are hidden by the database for this role (it needs the pg_read_all_stats role to see other users' queries).`) : null,
+    part.text_hidden ? h("p", { class: "hint insights-hidden" }, `${part.text_hidden} statement texts are hidden because the database role needs pg_read_all_stats to show other users' queries.`) : null,
     h("div", { class: "field insights-filter" }, h("label", { for: "insights-filter" }, "Filter statements"),
       h("input", { id: "insights-filter", type: "search", "aria-label": "Filter statements", value: state.filter, autocomplete: "off", onchange: (e) => { state.filter = e.target.value; state.refocus = true; rerender(); } })),
     rows.length ? table("Top queries", head, body) : h("p", { class: "empty" }, "No statements match."));
@@ -62,14 +62,19 @@ export function tunerBlock(part) {
 
 export function advisorBlock(part) {
   if (!part || !part.available) return unavailable("Index suggestions", part);
-  if (!part.suggestions.length) return h("section", { class: "card insights-block" }, h("h2", {}, "Index suggestions"), h("p", { class: "empty" }, "No filtered columns observed yet. Run some workload and refresh."));
-  const rows = part.suggestions.map((r) => h("tr", {},
+  const skipped = part.summary && part.summary.already_indexed > 0
+    ? h("p", { class: "hint insights-indexed" }, `${num(part.summary.already_indexed)} ${part.summary.already_indexed === 1 ? "suggestion" : "suggestions"} hidden: column already indexed.`) : null;
+  const shown = part.suggestions.filter((r) => r.suggestion);   // never a row with an empty suggestion
+  if (!shown.length) return h("section", { class: "card insights-block" }, h("h2", {}, "Index suggestions"), skipped,
+    h("p", { class: "empty" }, "No unindexed filtered columns observed yet. Run some workload and refresh."));
+  const rows = shown.map((r) => h("tr", {},
     h("td", {}, h("code", {}, r.table)), h("td", {}, h("code", {}, r.column)), h("td", {}, h("code", {}, r.operator)),
     h("td", { class: "num" }, num(r.executions)), h("td", { class: "num" }, num(r.rows_filtered)), h("td", { class: "num" }, num(r.filtered_per_execution, 1)),
-    h("td", {}, r.suggestion || "")));
+    h("td", {}, r.suggestion)));
   const th = (t, n) => h("th", { scope: "col", class: n ? "num" : "" }, t);
   return h("section", { class: "card insights-block" }, h("h2", {}, "Index suggestions"),
     h("p", { class: "hint" }, "From query_advisor. \"Rows filtered\" is how many rows the condition read and then discarded: what an index could save. A hint from observed workload, not a measured speed-up."),
+    skipped,
     table("Index suggestions", [th("Table"), th("Column"), th("Operator"), th("Executions", 1), th("Rows filtered", 1), th("Per execution", 1), th("Suggestion")], rows));
 }
 

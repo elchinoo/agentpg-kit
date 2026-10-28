@@ -1,6 +1,6 @@
 # agentpg-kit guide
 
-Version described: **0.3.0** (`apgkit.__version__` is the single source; `pyproject.toml` reads it). Everything below was checked against the
+Version described: **0.3.1** (`apgkit.__version__` is the single source; `pyproject.toml` reads it). Everything below was checked against the
 source in `src/apgkit`, the tests in `tests/`, and the way the other projects of the ecosystem use the kit. Where a statement could
 not be verified it is listed under [Known limitations](#13-known-limitations-and-things-not-verified).
 
@@ -533,7 +533,7 @@ with db.connect() as conn:
     insights.sources(conn)                      # {"edb_stat_monitor": {"available": True, "version": "2.1"}, "query_advisor": {"available": False, "reason": "permission denied for this database role"}, ...}
     insights.top_queries(conn, order="mean", limit=20)   # order: "total" | "mean" | "calls"; times in ms
     insights.tuner(conn)                        # {"available", "recommendations": [{"setting", "value", "raw"}], "global_stats": {...} | None}
-    insights.advisor(conn, limit=20)            # {"available", "suggestions": [{"schema","table","column","operator","occurrences","executions","rows_filtered","filtered_per_execution","suggestion"}]}
+    insights.advisor(conn, limit=20)            # {"available", "suggestions": [{"schema","table","column","operator","occurrences","executions","rows_filtered","filtered_per_execution","suggestion"}], "summary": {"already_indexed": N}}
     insights.insights_payload(conn, order="total", limit=20)   # {"sources","top_queries","tuner","advisor"}
 ```
 
@@ -549,7 +549,13 @@ with db.connect() as conn:
   `query_advisor_qualstats_pretty` and `query_advisor_qualstats_all`. Joins and catalog tables are left out. The "benefit" is
   `rows_filtered` (rows the condition read and then threw away) and `filtered_per_execution`: an observed hint that an index on that
   column could help, not a measured speed-up. `suggestion` is text only (`Consider an index on t (c)`, equality and range operators
-  only); nothing is executed. The platform's own `agentpg recommend all <instance>` builds fuller index/statistics recommendations from the same data.
+  only); nothing is executed. Since 0.3.1 the SQL leaves out, before the limit applies: dropped columns (`attisdropped`, the
+  `........pg.dropped.N........` placeholder, empty names), operators a btree cannot serve (so every row has a non-empty
+  `suggestion`), and columns that are the *leading* key column of a valid, non-partial index on that table (primary keys and unique
+  indexes included; invalid indexes, partial indexes, expression indexes and second-or-later columns do not count). The number of
+  groups hidden because of an existing index is `summary.already_indexed` (absent when the part is unavailable; older payloads
+  without it still render), and the UI says "N suggestions hidden: column already indexed.". The checks are plain catalog reads
+  (`pg_index`) under the same read-only savepoint and 5 s `statement_timeout`. The platform's own `agentpg recommend all <instance>` builds fuller index/statistics recommendations from the same data.
 - `tuner` returns the lines of `edb_pg_tuner_recommendations()` (such as `shared_buffers = '186 MB'`) parsed into setting and value
   (a line that does not parse keeps `raw` with an empty setting) plus the one-row `edb_pg_tuner_global_stats()` as a dict.
 
@@ -569,7 +575,8 @@ Statement text can reveal table names and the shape of the workload: keep it beh
 **UI**: `import { initInsights } from "/kit/insights.js"; initInsights(document.getElementById("main"), api)`. It calls
 `GET /api/insights?limit=50` once (Refresh calls it again) and renders a sortable (click a column header; `aria-sort` is set), filterable
 (press Enter in the filter box) top-queries table, the tuner recommendations and the advisor suggestions, each in a named scroll
-region with a screen-reader caption. A source that is not available shows "Not available on this database." with the server's reason.
+region with a screen-reader caption. A source that is not available shows "Not available on this database." with the server's reason. When statement texts come back as
+`<insufficient privilege>` it says that the database role needs `pg_read_all_stats` to show them.
 It exports `topQueriesBlock`, `tunerBlock`, `advisorBlock` for apps that want their own layout. Uses only existing tokens, `.sr-only`
 and `scrollRegion`; no inline style or script. Tested in node with a fake DOM (`tests/ui/insights.mjs`).
 
@@ -618,12 +625,43 @@ migrate.run(db, Path("migrations"), after_migrate=[hook])   # hooks run on EVERY
   user to be allowed to `SET ROLE`, else `sample_error`). `masking.unmask(...)` drops the view and gives SELECT on the table back.
 - `migrate.run(after_migrate=[...])` is new in 0.3.0: callables taking the connection, run in order on every call, with no transaction open.
 
+- `masking.deny_tables(conn, tables, readonly_role="a1p_readonly")` is the revoke-only variant (no view) for tables the role must not
+  see at all. One `REVOKE` per table, autocommit, idempotent, missing tables skipped. Returns the `mask_view` shape plus
+  `tables` (`{name: denied}`) and `skipped`. `masking.drift(conn, tables, role)` lists the tables the role can read right now.
+
+**Failure mode: grants after startup reopen tables.** `mask_view` and `deny_tables` are a snapshot. `agentpg db-users create` (and
+AgentPG's default privileges) grant `a1p_readonly` SELECT on base tables again at any time, including tables already masked, so
+after `ecoctl mcp users` the role could read raw PII from the base table (the view still masks, but the base is open) until the
+next app restart ran the migrate hook. Verified live on TrustDesk. Re-assert periodically:
+
+```python
+from apgkit import masking
+def apply(conn):                                  # the app's idempotent masking, the same calls as the migrate hook
+    masking.mask_view(conn, "employee", "employee_masked", {...})
+    masking.deny_tables(conn, ["audit_log"])
+# in the lifespan (below): task = asyncio.create_task(masking.reassert_forever(db.connect, apply, 300, deny=["employee", "audit_log"], metrics=metrics))
+```
+
+- `masking.reassert_forever(connect, apply, every=300, *, name="masking", deny=(), readonly_role="a1p_readonly", metrics=None, sleep=asyncio.sleep, clock=time.time)`
+  is a coroutine: it ticks at once and then every `every` seconds (minimum 1) until cancelled. Each tick runs in a worker thread
+  (`asyncio.to_thread`) on its own connection from `connect` (e.g. `db.connect`), so a slow database never blocks the event loop.
+  It never raises: a failure logs one warning line and the loop goes on. `deny` is the list of base tables that must stay closed: before
+  applying, the tick counts how many the role could read (drift) and logs a warning naming them. `masking.reassert_tick(...)` is one
+  blocking tick (returns bool) for tests or a scheduler.
+- Metrics (pass the kit's `Metrics` as `metrics`): gauge `masking_last_ok_timestamp`, counter `masking_reapplied_total`, gauge
+  `masking_drift_tables` (tables open before the last re-assert; alert on `> 0` and on a stale timestamp). A non-default `name` adds
+  the suffix `_<name>` to the three metrics.
+- `masking.status(name="masking")` returns `{"last_ok": ISO time | None, "drift": int | None, "ok": bool}` for a readiness or status route.
+- Recommended `every`: 300 s. The window in which a new grant is readable is at most one interval; shorter intervals only add catalog reads.
+  The loop narrows the window, it does not close it: a grant made just after a tick stays open until the next one.
+
 Limitations and gotchas:
 
 - **Only the table owner can revoke or grant.** A non-owner `REVOKE` only raises a warning and changes nothing, so `mask_view`
   checks `has_table_privilege` afterwards and reports `base_denied: False` (and logs a warning) instead of pretending. Run it as the role that owns the tables.
 - **Default privileges re-grant SELECT to `a1p_readonly` on every NEW table.** Mask after the tables exist and again at every migrate
-  (the hook does this); a table created later without a mask is readable by the read-only role.
+  (the hook does this); a table created later without a mask is readable by the read-only role. Grants made later reopen tables too:
+  see the re-assert loop above.
 - It protects the `a1p_readonly` path only: the app's own (owner) connection, `a1p_readwrite` members and the platform's owner role see raw data. `PUBLIC` grants would defeat it (reported as `base_denied: False`).
 - Hash masking is a short unsalted digest: it hides the value from casual reading, it does not stop a guess-and-compare of low-entropy values.
 - A view column with the `pass` rule or a raw expression is exactly as safe as the expression; review them.
@@ -739,7 +777,7 @@ export TEST_DATABASE_URL=postgresql://...      # throwaway database; tests drop 
 |---|---|
 | `tests/test_basics.py` | `read_secret`, `database_url` order, ids, password hashing, `FailureLimiter`, `NetGuard` (private, link-local, shape rules), `SecurityGuard` headers/CSRF/body caps (also chunked), `Metrics`, `LLMClient` bounded reads and typed errors, empty-answer messages |
 | `tests/test_db_blocks.py` | migrations (once, ordered, replacements, per-app tables), vault lifecycle and platform-secret unlock, setup flow, static key, sessions, token scope/hash/revocation, reset hook, upgrade of a pre-kit `web_session`, non-waiting pool, `Authenticator` static tokens, cache and public resolver |
-| `tests/test_insights.py` | insights with fakes shaped like `edb_stat_monitor`, `query_advisor_qualstats` and `edb_pg_tuner` (aggregation, filtering, truncation, no plan/IP/user leak, parsing), nothing installed, unreadable source via a real unprivileged role, metrics collector; `pg_stat_statements` only if loaded (else skipped) |
+| `tests/test_insights.py` | insights with fakes shaped like `edb_stat_monitor`, `query_advisor_qualstats` and `edb_pg_tuner` (aggregation, filtering, truncation, no plan/IP/user leak, parsing, advisor dropped-column and already-indexed suppression against a real `pg_index`), nothing installed, unreadable source via a real unprivileged role, metrics collector; `pg_stat_statements` only if loaded (else skipped) |
 | `tests/test_masking.py` | real roles `a1p_readonly` and a login member: base table denied, masked view allowed, writes refused, idempotent re-run, view column changes, after-migrate hook re-masks, missing role skipped, non-owner reported, `describe`/`unmask`, input validation |
 | `tests/test_oidc.py` | `TokenVerifier` (valid, audience list, bad claims, wrong key, `alg=none` and HMAC confusion, key rotation, refresh rate limit, discovery issuer check), `principal_from_claims`, `TokenSource` caching, `safe_return_to`, full PKCE login flow including single-use state, public client, `Authenticator` with every credential kind, rate limiting |
 | `tests/test_ui.py` | runs each `tests/ui/*.mjs` under node (skipped without node); asserts no `innerHTML`-style APIs and no native dialogs in shared JS; asserts every kit-rendered control has an accessible name |

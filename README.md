@@ -130,6 +130,10 @@ pytest -q
 
 ## Changelog
 
+### 0.3.1
+- Fix: the insights index suggestions no longer list dropped columns (`........pg.dropped.N........`), columns that already lead a valid index or primary key, or rows without a suggestion. `advisor()` adds `summary: {"already_indexed": N}` (additive; existing keys unchanged) and `insights.js` shows "N suggestions hidden: column already indexed." and a plainer message when statement texts are hidden (the role needs `pg_read_all_stats`). Apps only need to raise their kit pin for this.
+- New: `masking.deny_tables(conn, tables, readonly_role)` (revoke-only helper, idempotent, skips missing tables), `masking.drift(...)`, and `masking.reassert_forever(connect, apply, every=300, ...)` (+ `reassert_tick`, `status`), a lifespan loop that re-applies the app's masking because `agentpg db-users create` and default privileges re-grant SELECT on base tables after startup. Metrics `masking_last_ok_timestamp`, `masking_reapplied_total`, `masking_drift_tables`. See GUIDE 7.11.
+
 ### 0.3.0
 - New: `apgkit.insights` (query insights from `edb_stat_monitor`, `pg_stat_statements`, `edb_pg_tuner`, `query_advisor`; every source degrades to `{"available": false, "reason"}`), `metrics.add_insights_collector` (small-cardinality gauges), shared `static/insights.js` (`initInsights(root, api)`) and `apgkit.masking` (database-enforced masking views for the AgentPG read-only role `a1p_readonly`).
 - New: `migrate.run(..., after_migrate=[hook, ...])`, hooks run on every call after the migrations commit (backward compatible; default empty).

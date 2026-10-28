@@ -13,13 +13,19 @@ Facts and gotchas (verified on an AgentPG instance):
 - Each statement runs in its own autocommit step: a multi-statement call rolls back as a whole on any error.
 - The view runs with its owner's rights (that is what lets the role read through it); `security_barrier` stops a role's own functions
   from seeing unmasked rows through pushed-down predicates. A view column rule that is "pass" shows the value as is.
+- Grants made AFTER startup reopen tables: `agentpg db-users create` and the default privileges give the role SELECT on base tables
+  again at any time, not only on new ones. A one-off call at migrate time is therefore not enough: run `reassert_forever` (below).
 - Where the role does not exist (plain Postgres in dev/CI) masking is skipped and logged, never an error.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
-from collections.abc import Mapping
+import threading
+import time
+from collections.abc import Callable, Iterable, Mapping
+from contextlib import AbstractContextManager
 from typing import Any
 
 import psycopg
@@ -188,3 +194,124 @@ def describe(conn: psycopg.Connection, table: str, view: str, readonly_role: str
                 out["sample_error"] = str(exc).strip().splitlines()[0]
     conn.commit()
     return out
+
+
+def _existing(conn: psycopg.Connection, tables: Iterable[str]) -> tuple[list[tuple[str, str, str]], list[str]]:
+    found, missing = [], []
+    for t in tables:
+        schema, rel = _qualified(t)
+        if _q(conn, "SELECT to_regclass(%s) IS NOT NULL AS ok", (_fq(schema, rel),))[0]["ok"]:
+            found.append((t, schema, rel))
+        else:
+            missing.append(t)
+    return found, missing
+
+
+def deny_tables(conn: psycopg.Connection, tables: Iterable[str], readonly_role: str = READONLY_ROLE) -> dict[str, Any]:
+    """REVOKE SELECT on each base table from `readonly_role`, with no view (for tables the role must not see at all). Idempotent; one
+    statement per table in autocommit; tables that do not exist are skipped. Skips (applied False) if the role does not exist.
+    Returns the shape of `mask_view` plus `tables` ({name: denied}) and `skipped` (missing tables): `base_denied` is True only if the
+    role can read none of the existing tables afterwards (checked with has_table_privilege; a non-owner REVOKE changes nothing)."""
+    _ident(readonly_role)
+    tables = list(tables)
+    with _Autocommit(conn):
+        if not _role_exists(conn, readonly_role):
+            log.info("deny_tables skipped: role %s does not exist", readonly_role)
+            return {"applied": False, "reason": f"role {readonly_role} does not exist", "base_denied": False, "view_readable": False,
+                    "tables": {}, "skipped": []}
+        found, missing = _existing(conn, tables)
+        for _, schema, rel in found:
+            conn.execute(sql.SQL("REVOKE SELECT ON {} FROM {}").format(sql.Identifier(schema, rel), sql.Identifier(readonly_role)))
+        result = {t: not _can_select(conn, readonly_role, schema, rel) for t, schema, rel in found}
+    denied = all(result.values())
+    if not denied:
+        log.warning("deny_tables: %s can still read %s (not the owner, or PUBLIC has SELECT)", readonly_role,
+                    ", ".join(t for t, ok in result.items() if not ok))
+    return {"applied": denied, "reason": "" if denied else "some tables still readable by the role", "base_denied": denied,
+            "view_readable": False, "tables": result, "skipped": missing}
+
+
+def drift(conn: psycopg.Connection, tables: Iterable[str], readonly_role: str = READONLY_ROLE) -> list[str]:
+    """Which of `tables` (that exist) the role can SELECT right now although they should be denied. [] if the role is missing."""
+    _ident(readonly_role)
+    conn.commit()
+    if not _role_exists(conn, readonly_role):
+        return []
+    found, _ = _existing(conn, tables)
+    out = [t for t, schema, rel in found if _can_select(conn, readonly_role, schema, rel)]
+    conn.commit()
+    return out
+
+
+_STATE: dict[str, dict[str, Any]] = {}
+_STATE_LOCK = threading.Lock()
+
+
+def status(name: str = "masking") -> dict[str, Any]:
+    """What the re-assert loop `name` last did: {"last_ok": ISO UTC time or None, "drift": tables found open before the last
+    apply (None until the first tick), "ok": last tick succeeded}. Use it in a readiness/status route."""
+    with _STATE_LOCK:
+        st = dict(_STATE.get(name, {}))
+    ts = st.get("last_ok")
+    return {"last_ok": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)) if ts else None, "drift": st.get("drift"),
+            "ok": bool(st.get("ok", False))}
+
+
+def _metrics_for(metrics: Any, name: str) -> tuple[Any, Any, Any]:
+    from prometheus_client import Counter, Gauge
+    cache = metrics.__dict__.setdefault("_masking_metrics", {})
+    if name not in cache:
+        reg = metrics.registry
+        suffix = "" if name == "masking" else f"_{re.sub(r'[^a-z0-9_]', '_', name.lower())}"
+        cache[name] = (Gauge(f"masking_last_ok_timestamp{suffix}", "Unix time of the last successful masking re-assert", registry=reg),
+                       Counter(f"masking_reapplied_total{suffix}", "Masking re-asserts that ran successfully", registry=reg),
+                       Gauge(f"masking_drift_tables{suffix}", "Tables the read-only role could read before the last re-assert", registry=reg))
+    return cache[name]
+
+
+def reassert_tick(connect: Callable[[], AbstractContextManager], apply: Callable[[psycopg.Connection], Any], *, name: str = "masking",
+                  deny: Iterable[str] = (), readonly_role: str = READONLY_ROLE, metrics: Any = None,
+                  clock: Callable[[], float] = time.time) -> bool:
+    """One re-assert (blocking): count drift for `deny`, run `apply(conn)` on its own connection, record state and metrics. Never raises."""
+    deny = list(deny)
+    try:
+        with connect() as conn:
+            opened = drift(conn, deny, readonly_role) if deny else []
+            apply(conn)
+            try:
+                conn.commit()
+            except psycopg.Error:
+                pass
+    except Exception as exc:   # noqa: BLE001 - a background loop must survive anything
+        with _STATE_LOCK:
+            _STATE.setdefault(name, {})["ok"] = False
+        log.warning("%s re-assert failed: %s", name, str(exc).strip().splitlines()[0][:200] if str(exc).strip() else type(exc).__name__)
+        return False
+    now = clock()
+    with _STATE_LOCK:
+        _STATE[name] = {"last_ok": now, "drift": len(opened), "ok": True}
+    if opened:
+        log.warning("%s: %d table(s) were readable by %s and have been re-secured: %s", name, len(opened), readonly_role, ", ".join(opened))
+    if metrics is not None:
+        try:
+            last, total, dr = _metrics_for(metrics, name)
+            last.set(now)
+            total.inc()
+            dr.set(len(opened))
+        except Exception:   # noqa: BLE001
+            log.warning("%s: could not update metrics", name)
+    return True
+
+
+async def reassert_forever(connect: Callable[[], AbstractContextManager], apply: Callable[[psycopg.Connection], Any], every: float = 300,
+                           *, name: str = "masking", deny: Iterable[str] = (), readonly_role: str = READONLY_ROLE, metrics: Any = None,
+                           sleep: Callable[[float], Any] = asyncio.sleep, clock: Callable[[], float] = time.time) -> None:
+    """Run the app's idempotent `apply(conn)` (its `mask_view`/`deny_tables` calls) now and then every `every` seconds on its own
+    connection in a worker thread, until cancelled. Never raises (failures log one warning line and the loop goes on). `deny` lists
+    base tables that must stay closed: each tick first counts how many the role could read (`masking_drift_tables` gauge, `drift` in
+    `status(name)`). Pass the kit's `Metrics` as `metrics` for `masking_last_ok_timestamp`, `masking_reapplied_total` and
+    `masking_drift_tables`. `sleep`/`clock` are injectable for tests."""
+    every = max(1.0, float(every))
+    while True:
+        await asyncio.to_thread(reassert_tick, connect, apply, name=name, deny=deny, readonly_role=readonly_role, metrics=metrics, clock=clock)
+        await sleep(every)

@@ -42,7 +42,8 @@ const api = async () => { calls++; if (payload instanceof Error) throw payload; 
 const main = new El("div"); body.append(main);
 await initInsights(main, api);
 const firstCol = () => main.findAll((e) => e.tag === "td" && e.className === "insights-sql").map((e) => e.text().trim());
-check(!main.text().includes("hidden by the database"), "no hidden-text note when all texts are visible");
+check(!main.text().includes("pg_read_all_stats"), "no hidden-text note when all texts are visible");
+check(!main.text().includes("already indexed"), "no already-indexed line when nothing was hidden");
 check(main.text().includes("Tuning recommendations") && main.text().includes("shared_buffers") && main.text().includes("Consider an index on public.a (id)"), "all three sources render");
 check(firstCol()[0].includes("count(*)"), "default sort is total time, descending");
 const header = (label) => main.find((e) => e.tag === "button" && e.text().startsWith(label));
@@ -60,7 +61,22 @@ check(main.findAll((e) => e.attrs.role === "region" && e.attrs["aria-label"]).le
 payload = { ...full, top_queries: { ...full.top_queries, text_hidden: 2 } };
 await main.find((e) => e.tag === "button" && e.text() === "Refresh").listeners.click();
 await new Promise((r) => setTimeout(r, 5));
-check(main.text().includes("2 statement texts are hidden by the database"), "hidden statement texts are explained");
+check(main.text().includes("2 statement texts are hidden because the database role needs pg_read_all_stats"), "hidden statement texts are explained");
+
+// advisor: the hidden-by-index line and no empty-suggestion rows
+payload = { ...full, advisor: { available: true, summary: { already_indexed: 3 }, suggestions: [full.advisor.suggestions[0], { ...full.advisor.suggestions[0], column: "zzz", suggestion: "" }] } };
+await main.find((e) => e.tag === "button" && e.text() === "Refresh").listeners.click();
+await new Promise((r) => setTimeout(r, 5));
+check(main.text().includes("3 suggestions hidden: column already indexed."), "already-indexed count is shown");
+check(!main.text().includes("zzz"), "a row with an empty suggestion is not rendered");
+payload = { ...full, advisor: { available: true, summary: { already_indexed: 1 }, suggestions: [] } };
+await main.find((e) => e.tag === "button" && e.text() === "Refresh").listeners.click();
+await new Promise((r) => setTimeout(r, 5));
+check(main.text().includes("1 suggestion hidden: column already indexed.") && main.text().includes("No unindexed filtered columns"), "all suggestions hidden: line plus empty message");
+payload = { ...full, advisor: { available: true, suggestions: full.advisor.suggestions } };   // old payload without summary still renders
+await main.find((e) => e.tag === "button" && e.text() === "Refresh").listeners.click();
+await new Promise((r) => setTimeout(r, 5));
+check(main.text().includes("Consider an index on public.a (id)") && !main.text().includes("already indexed"), "payload without summary is backwards compatible");
 
 // every source missing: an honest state per source, no tables, the reason is shown
 payload = { sources: {}, top_queries: none, tuner: { available: false, reason: "permission denied for this database role" }, advisor: none };
@@ -78,7 +94,7 @@ check(main.find((e) => e.attrs.role === "alert") && retry, "error state with ret
 payload = full;
 retry.listeners.click();
 await new Promise((r) => setTimeout(r, 5));
-check(main.text().includes("Top queries") && calls === 5, "retry loads again");
+check(main.text().includes("Top queries") && calls === 8, "retry loads again");
 
 console.log(bad ? "FAILED" : "ok: insights render, sort, filter, degrade per source and retry");
 process.exit(bad ? 1 : 0);

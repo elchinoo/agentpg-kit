@@ -162,36 +162,50 @@ def tuner(conn: psycopg.Connection) -> dict[str, Any]:
     return {"available": True, "recommendations": recs, "global_stats": stats}
 
 
-_OPS = {"=", "<", ">", "<=", ">=", "~~", "~~*"}
-_ADV = """
+_OPS = ("=", "<", ">", "<=", ">=", "~~", "~~*")
+# pg_attribute keeps a dropped column as "........pg.dropped.N........"; it must never reach the UI
+_DROPPED = r"^\.*pg\.dropped\.\d+\.*$"
+_ADV_BASE = """
+WITH agg AS (
 SELECT n.nspname::text AS schema, q.lrelid::regclass::text AS "table", a.attname::text AS "column", o.oprname::text AS operator,
-       sum(q.occurrences)::bigint AS occurrences, sum(q.execution_count)::bigint AS executions, sum(q.nbfiltered)::bigint AS rows_filtered
+       sum(q.occurrences)::bigint AS occurrences, sum(q.execution_count)::bigint AS executions, sum(q.nbfiltered)::bigint AS rows_filtered,
+       EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = q.lrelid AND i.indisvalid AND i.indpred IS NULL
+                  AND i.indkey[0] = q.lattnum) AS indexed
   FROM query_advisor_qualstats q
   JOIN pg_class c ON c.oid = q.lrelid JOIN pg_namespace n ON n.oid = c.relnamespace
   JOIN pg_attribute a ON a.attrelid = q.lrelid AND a.attnum = q.lattnum
   JOIN pg_operator o ON o.oid = q.opno
  WHERE q.rrelid IS NULL AND q.dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
    AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg\\_%%'
- GROUP BY 1, 2, 3, 4 HAVING sum(q.execution_count) > 0
- ORDER BY sum(q.nbfiltered) DESC, 2, 3 LIMIT %(limit)s
+   AND a.attnum > 0 AND NOT a.attisdropped AND a.attname <> '' AND a.attname::text !~ %(dropped)s
+   AND o.oprname::text = ANY(%(ops)s)
+ GROUP BY q.lrelid, q.lattnum, 1, 2, 3, 4 HAVING sum(q.execution_count) > 0 AND sum(q.nbfiltered) > 0
+)
 """
+_ADV = _ADV_BASE + """SELECT schema, "table", "column", operator, occurrences, executions, rows_filtered FROM agg WHERE NOT indexed
+ ORDER BY rows_filtered DESC, 2, 3 LIMIT %(limit)s"""
+_ADV_COUNT = _ADV_BASE + "SELECT count(*)::bigint AS n FROM agg WHERE indexed"
 
 
 def advisor(conn: psycopg.Connection, limit: int = 20) -> dict[str, Any]:
     """query_advisor's qualifier statistics in readable form (read from the base view `query_advisor_qualstats`, resolved to
     table/column/operator names here: the `_pretty` and `_all` views are not granted to the AgentPG login role). `rows_filtered` is the number of rows the qualifier read and then threw
-    away: the benefit an index on that column could remove. It is a hint from observed workload, not a measured speed-up."""
+    away: the benefit an index on that column could remove. It is a hint from observed workload, not a measured speed-up.
+
+    Left out: dropped columns, operators a btree cannot serve, and columns that already lead a valid, non-partial index (primary key and
+    unique indexes included). The number hidden for the last reason is `summary["already_indexed"]`."""
+    params = {"limit": max(1, min(int(limit), 100)), "dropped": _DROPPED, "ops": list(_OPS)}
     try:
-        rows = _run(conn, _ADV, {"limit": max(1, min(int(limit), 100))})
+        rows = _run(conn, _ADV, params)
+        hidden = _run(conn, _ADV_COUNT, params)[0]["n"]
     except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedFunction):
         return _unavailable("query_advisor is not installed on this database")
     except psycopg.Error as exc:
         return _unavailable(_why(exc))
     for r in rows:
         r["filtered_per_execution"] = round(r["rows_filtered"] / r["executions"], 2)
-        r["suggestion"] = (f'Consider an index on {r["table"]} ({r["column"]})'
-                           if r["operator"] in _OPS and r["rows_filtered"] > 0 else "")
-    return {"available": True, "suggestions": rows}
+        r["suggestion"] = f'Consider an index on {r["table"]} ({r["column"]})'
+    return {"available": True, "suggestions": rows, "summary": {"already_indexed": int(hidden)}}
 
 
 def insights_payload(conn: psycopg.Connection, order: str = "total", limit: int = 20) -> dict[str, Any]:

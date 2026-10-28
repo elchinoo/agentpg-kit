@@ -104,12 +104,81 @@ def test_tuner_and_advisor(db):
         assert t["global_stats"]["db_size"] == 418444
         a = insights.advisor(c)
         rows = {(r["table"], r["column"]): r for r in a["suggestions"]}
-        assert set(rows) == {("orders", "id"), ("stock", "id")}          # joins, never-executed and catalog rows are left out
+        assert set(rows) == {("orders", "id")}          # joins, never-executed, catalog and '<>' (no btree) rows are left out
         o = rows[("orders", "id")]
         assert (o["executions"], o["rows_filtered"], o["filtered_per_execution"]) == (50, 5000, 100.0)
         assert o["suggestion"] == "Consider an index on orders (id)"
-        assert rows[("stock", "id")]["suggestion"] == ""                 # '<>' cannot use a btree index
+        assert a["summary"] == {"already_indexed": 0}
         assert a["suggestions"][0]["table"] == "orders"                  # biggest benefit first
+
+
+ADV_SCHEMA = """
+CREATE TABLE request (id int PRIMARY KEY, token_hash text, expires_at timestamptz, status text, legacy text, tenant int, payload text);
+CREATE UNIQUE INDEX request_token ON request (token_hash);
+CREATE INDEX request_exp_status ON request (expires_at, status);          -- status is NOT leading
+CREATE INDEX request_partial ON request (tenant) WHERE status = 'open';   -- partial: does not cover tenant
+CREATE INDEX request_expr ON request (lower(payload));                    -- expression: covers no plain column
+ALTER TABLE request DROP COLUMN legacy;
+CREATE TABLE query_advisor_qualstats (userid oid, dbid oid, lrelid oid, lattnum smallint, opno oid, rrelid oid, rattnum smallint,
+  occurrences bigint, execution_count bigint, nbfiltered bigint, queryid bigint);
+"""
+
+
+def _qual(table, column, op="=", filtered=100, executions=10, db_oid="d.oid"):
+    return (f"INSERT INTO query_advisor_qualstats SELECT 10, {db_oid}, '{table}'::regclass, a.attnum, "
+            f"'{op}(int4,int4)'::regoperator, NULL, NULL, 1, {executions}, {filtered}, 1 FROM pg_database d, pg_attribute a "
+            f"WHERE d.datname = current_database() AND a.attrelid = '{table}'::regclass AND a.attname = '{column}';")
+
+
+def test_advisor_hides_dropped_and_already_indexed_columns(db):
+    ddl = ADV_SCHEMA + "".join([
+        _qual("request", "id", filtered=900),              # primary key: suppressed
+        _qual("request", "token_hash", filtered=800),      # unique index: suppressed
+        _qual("request", "expires_at", filtered=700),      # leading column of a composite index: suppressed
+        _qual("request", "status", filtered=600),          # only the second column of an index: kept
+        _qual("request", "tenant", filtered=500),          # only a partial index: kept
+        _qual("request", "payload", filtered=400),         # only an expression index: kept
+        _qual("request", "id", op="<", filtered=300),      # same column, other operator: still suppressed, counted separately
+    ])
+    with _conn(db, ddl) as c:
+        # the dropped column's qualifier rows: attnum of the dropped attribute, bogus operator included
+        c.execute("INSERT INTO query_advisor_qualstats SELECT 10, d.oid, 'request'::regclass, a.attnum, '=(int4,int4)'::regoperator, NULL, NULL, 1, 10, 5000, 1 "
+                  "FROM pg_database d, pg_attribute a WHERE d.datname = current_database() AND a.attrelid = 'request'::regclass AND a.attisdropped")
+        assert c.execute("SELECT count(*) FROM pg_attribute WHERE attrelid = 'request'::regclass AND attname LIKE '%pg.dropped%'").fetchone()["count"] == 1
+        c.commit()
+        a = insights.advisor(c)
+        cols = [r["column"] for r in a["suggestions"]]
+        assert cols == ["status", "tenant", "payload"]                     # biggest benefit first, no placeholder, no empty names
+        assert all(r["suggestion"] == f"Consider an index on request ({r['column']})" for r in a["suggestions"])
+        assert a["summary"] == {"already_indexed": 4}                      # id (=), token_hash, expires_at, id (<)
+
+
+def test_advisor_ignores_invalid_index(db):
+    with _conn(db, ADV_SCHEMA + _qual("request", "token_hash", filtered=800)) as c:
+        assert insights.advisor(c)["suggestions"] == [] and insights.advisor(c)["summary"]["already_indexed"] == 1
+        c.execute("CREATE TABLE t2 (k int)")
+        c.execute("INSERT INTO query_advisor_qualstats SELECT 10, d.oid, 't2'::regclass, 1, '=(int4,int4)'::regoperator, NULL, NULL, 1, 10, 50, 1 FROM pg_database d WHERE d.datname = current_database()")
+        c.commit()
+        # an index left INVALID (a failed CREATE INDEX CONCURRENTLY) does not serve queries: the hint stays
+        c.execute("CREATE INDEX t2_k ON t2 (k)")
+        c.commit()
+        assert [r["table"] for r in insights.advisor(c)["suggestions"]] == []
+        try:
+            c.execute("UPDATE pg_index SET indisvalid = false WHERE indexrelid = 't2_k'::regclass")
+        except psycopg.Error:
+            c.rollback()
+            pytest.skip("cannot edit pg_index here")
+        c.commit()
+        r = insights.advisor(c)
+        assert [x["table"] for x in r["suggestions"]] == ["t2"]
+
+
+def test_advisor_summary_in_payload_and_unavailable_without_it(db):
+    with _conn(db) as c:
+        assert "summary" not in insights.advisor(c)                        # unavailable: just {"available": False, "reason"}
+    with _conn(db, ADV_SCHEMA) as c:
+        p = insights.insights_payload(c)
+        assert p["advisor"]["available"] and p["advisor"]["suggestions"] == [] and p["advisor"]["summary"] == {"already_indexed": 0}
 
 
 def test_unreadable_source_is_reported_not_raised(db):

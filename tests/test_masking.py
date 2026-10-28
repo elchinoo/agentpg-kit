@@ -132,3 +132,101 @@ def test_describe_sample_unmask_and_validation(db, roles):
             masking.mask_view(c, "customer", "v", {})
         with pytest.raises(ValueError):
             masking.mask_view(c, "customer", "v", {"nope": "null"})
+
+
+# ---- deny_tables, drift and the re-assert loop ----
+import asyncio  # noqa: E402
+import logging  # noqa: E402
+
+
+def test_deny_tables_revokes_skips_missing_and_is_idempotent(db, roles):
+    _table(db)
+    with db.connect() as c:
+        c.execute("CREATE TABLE audit (id int)")
+        c.execute("GRANT SELECT ON audit TO a1p_readonly")
+        c.execute("GRANT USAGE ON SCHEMA public TO a1p_readonly")
+        c.commit()
+        r = masking.deny_tables(c, ["customer", "audit", "nope"])
+        assert r["applied"] and r["base_denied"] and r["tables"] == {"customer": True, "audit": True} and r["skipped"] == ["nope"]
+        assert masking.deny_tables(c, ["customer", "audit"])["applied"]          # idempotent
+        with _ro() as ro, pytest.raises(psycopg.errors.InsufficientPrivilege):
+            ro.execute("SELECT * FROM audit")
+        with pytest.raises(ValueError):
+            masking.deny_tables(c, ["bad name;"])
+
+
+def test_deny_tables_without_the_role_is_skipped(db):
+    with db.connect() as c:
+        c.execute("DROP ROLE IF EXISTS a1p_readonly_absent")
+        r = masking.deny_tables(c, ["customer"], readonly_role="a1p_readonly_absent")
+        assert r["applied"] is False and "does not exist" in r["reason"]
+
+
+def test_reassert_tick_closes_a_regranted_table(db, roles):
+    _table(db)
+    name = "masking_t1"
+    with db.connect() as c:
+        _mask(c)
+    apply = lambda conn: (_mask(conn), masking.deny_tables(conn, ["customer"]))   # noqa: E731
+    assert masking.reassert_tick(db.connect, apply, name=name, deny=["customer"]) is True
+    assert masking.status(name)["drift"] == 0 and masking.status(name)["last_ok"]
+    with db.connect() as c:                                          # `agentpg db-users create` / default privileges re-grant
+        c.execute("GRANT SELECT ON customer TO a1p_readonly")
+        c.commit()
+        assert masking.describe(c, "customer", "customer_masked")["base_readable"]
+    with _ro() as ro:
+        assert ro.execute("SELECT ssn FROM customer").fetchone()["ssn"] == "123-45-6789"      # the window the loop closes
+    assert masking.reassert_tick(db.connect, apply, name=name, deny=["customer"]) is True
+    assert masking.status(name)["drift"] == 1
+    with db.connect() as c:
+        assert not masking.describe(c, "customer", "customer_masked")["base_readable"]
+        assert masking.drift(c, ["customer"]) == []
+    with _ro() as ro, pytest.raises(psycopg.errors.InsufficientPrivilege):
+        ro.execute("SELECT ssn FROM customer")
+
+
+def test_reassert_tick_never_raises_and_logs_one_line(db, caplog):
+    def boom(conn):
+        raise RuntimeError("kaput\nsecond line")
+    with caplog.at_level(logging.WARNING, logger="apgkit.masking"):
+        assert masking.reassert_tick(db.connect, boom, name="masking_t2") is False
+    lines = [r.getMessage() for r in caplog.records if "re-assert failed" in r.getMessage()]
+    assert lines == ["masking_t2 re-assert failed: kaput"]
+    assert masking.status("masking_t2")["ok"] is False
+    assert masking.reassert_tick(lambda: (_ for _ in ()).throw(OSError("down")), boom, name="masking_t2") is False   # connect failure too
+
+
+def test_reassert_metrics(db, roles):
+    from apgkit.metrics import Metrics
+    m = Metrics("t", "0")
+    _table(db)
+    masking.reassert_tick(db.connect, lambda conn: _mask(conn), name="masking", deny=["customer"], metrics=m, clock=lambda: 1234.0)
+    masking.reassert_tick(db.connect, lambda conn: _mask(conn), name="masking", deny=["customer"], metrics=m, clock=lambda: 1234.0)
+    text = m.render()[0].decode()
+    assert "masking_last_ok_timestamp 1234.0" in text and "masking_reapplied_total 2.0" in text and "masking_drift_tables 0.0" in text
+
+
+def test_reassert_forever_loops_with_fake_sleep_and_survives_errors():
+    ticks, sleeps = [], []
+
+    class Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def commit(self): pass
+
+    def apply(conn):
+        ticks.append(1)
+        if len(ticks) == 2:
+            raise RuntimeError("transient")
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+        if len(sleeps) == 3:
+            raise asyncio.CancelledError
+
+    async def run():
+        with pytest.raises(asyncio.CancelledError):
+            await masking.reassert_forever(Conn, apply, every=300, name="masking_t3", sleep=fake_sleep, clock=lambda: 5.0)
+    asyncio.run(run())
+    assert len(ticks) == 3 and sleeps == [300, 300, 300]          # the failing tick did not stop the loop
+    assert masking.status("masking_t3")["ok"] is True
