@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en" data-csrf="X-Notes-CSRF">
+<head>
+<meta charset="utf-8">
+<title>Notes</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="/kit/favicon.svg">
+<link rel="stylesheet" href="/kit/base.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="/"><img src="/kit/logo.svg" alt="" width="34" height="34"><span>Notes</span></a>
+  <button id="signout" class="ghost" type="button" hidden>Sign out</button>
+</header>
+<div id="vault-banner" class="banner" hidden></div>
+<main>
+  <section id="auth-card" class="card narrow" hidden></section>
+  <section id="view" hidden></section>
+</main>
+<div id="toast" class="toast" role="status" aria-live="polite" popover="manual" hidden></div>
+<script src="/static/app.js" type="module"></script>
+</body>
+</html>

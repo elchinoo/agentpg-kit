@@ -2,7 +2,10 @@
 
 Every app keeps numbered `.sql` files in its own `migrations/` directory. `bootstrap` creates the tables every app shares.
 """
+from collections.abc import Callable, Sequence
 from pathlib import Path
+
+import psycopg
 
 from .db import Database
 
@@ -12,8 +15,12 @@ CREATE TABLE IF NOT EXISTS app_setting (key text PRIMARY KEY, value text NOT NUL
 
 
 def run(db: Database, directory: Path, *, extensions: tuple[str, ...] = (), replacements: dict[str, str] | None = None,
-        table: str = "schema_migrations") -> list[str]:
-    """Apply the migrations in `directory` that have not run yet, in name order. Returns the names applied."""
+        table: str = "schema_migrations", after_migrate: Sequence[Callable[[psycopg.Connection], None]] = ()) -> list[str]:
+    """Apply the migrations in `directory` that have not run yet, in name order. Returns the names applied.
+
+    `after_migrate` hooks run on every call (also when nothing was applied), after the migrations are committed, in order, each
+    receiving the connection with no transaction open (so a hook may switch to autocommit, as `masking.mask_view` does). Make them
+    idempotent. Example: `after_migrate=[lambda c: masking.mask_view(c, "customer", "customer_masked", {...})]`."""
     applied: list[str] = []
     with db.connect() as conn:
         for ext in extensions:
@@ -33,4 +40,7 @@ def run(db: Database, directory: Path, *, extensions: tuple[str, ...] = (), repl
             conn.execute(f"INSERT INTO {table} (name) VALUES (%s)", (path.name,))
             applied.append(path.name)
         conn.commit()
+        for hook in after_migrate:
+            hook(conn)
+            conn.commit()
     return applied

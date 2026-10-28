@@ -34,7 +34,7 @@ def test_the_shared_ui_never_uses_native_dialogs():
 
 def test_every_kit_rendered_form_control_has_an_accessible_name():
     import re
-    for js in (STATIC / "ui.js", STATIC / "session.js"):
+    for js in (STATIC / "ui.js", STATIC / "session.js", STATIC / "insights.js"):
         src = js.read_text()
         for m in re.finditer(r'h\("(input|select|textarea)",([^\n]*)', src):
             line = m.group(2)

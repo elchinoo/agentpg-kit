@@ -1,7 +1,7 @@
 [project]
 name = "agentpg-kit"
-version = "0.2.5"
-description = "Small reusable blocks for apps on AgentPG: config, Postgres, migrations, secrets vault, outbound-URL guard, LLM client, security middleware, metrics, MCP helper and federated (OIDC) authentication."
+dynamic = ["version"]
+description = "Small reusable blocks for apps on AgentPG: config, Postgres, migrations, secrets vault, outbound-URL guard, LLM client, security middleware, metrics and federated (OIDC) authentication."
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -17,12 +17,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp>=2.3"]
 dev = ["pytest>=8", "ruff>=0.6", "uvicorn>=0.30"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/apgkit/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/apgkit"]

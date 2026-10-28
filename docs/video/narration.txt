@@ -1,0 +1,202 @@
+## 1 af_heart
+Most small web apps need the same dull parts before they do anything useful.
+
+A login. A place to keep secrets. A safe way to talk to the database.
+
+...
+
+In this video we build a small app called Notes. We build it on agentpg-kit, the shared library behind every app in the AgentPG ecosystem.
+
+And we get all of that without writing it.
+
+## 2 af_heart
+The kit is a library, not a server. It is a handful of small blocks.
+
+Let's look at them.
+
+First, the vault. It encrypts stored secrets.
+
+Next, auth. One front door for every kind of caller. It accepts an admin password, an API token, or a token from a company identity provider.
+
+There is also a security middleware.
+
+And a shared browser interface. It is served from a path called slash kit.
+
+The apps in this ecosystem are built from these same blocks. TrustDesk, PagerLens, and PayBroker are examples.
+
+## 3 am_michael
+Now, the install. We start from a ready folder. It holds a handful of files.
+
+We copy it. Then we make a virtual environment, and install two things. The kit, and our app.
+
+[pause 2.0]
+
+In your own project you would install the kit from a release tag. The guide shows the command.
+
+Now we tell the app where its database is. One environment variable.
+
+The kit also understands the names that AgentPG sets for you. So this same app runs on a sandbox, unchanged.
+
+## 4 am_michael
+This is the whole security model of the app.
+
+First, roles. An admin can do everything. An editor can read and write notes. A viewer can only read.
+
+...
+
+Next, the vault line. That gives us encrypted storage.
+
+The line after it turns on single sign-on, but only if an identity provider address is set.
+
+Then local login. And one authenticator, which is the front door.
+
+Now the database. It needs one table. The kit runs this migration once, on start.
+
+Last, a route. The delete route names the permission it needs.
+
+Notice that the code never asks who you are. It asks one question. Can this caller write notes?
+
+The kit answers that for every kind of credential.
+
+## 5 af_bella
+Now, the first run. We start the app.
+
+[pause 2.5]
+
+On first start, nobody has an account. And we do not want anyone who finds the address to claim the admin role.
+
+So the app prints a one-time setup code, in its own log. Here it is.
+
+Only someone who can read the server's log can see it. That proves you run this server.
+
+## 6 af_bella
+The browser shows the setup screen that comes with the kit.
+
+Paste the code. Then choose a password of at least twelve characters, and confirm it.
+
+...
+
+The password is stored only as a salted hash. Never as plain text.
+
+That one step also creates the vault. So the same password protects the secrets we are about to store.
+
+We are signed in. This is the Notes screen, built from the kit's shared components.
+
+## 7 af_bella
+Let's add two notes. A normal one first.
+
+...
+
+Now a private one. We tick the private box.
+
+In the browser, both look the same, except for a badge.
+
+Now let's look at what the database holds.
+
+[pause 2.5]
+
+The normal note is plain text.
+
+The private note is scrambled.
+
+The vault encrypted it before it was saved. And the key is not in the database.
+
+So someone with a copy of the database, but without the admin password, could not read it.
+
+## 8 am_eric
+Now, deleting. Deleting asks for confirmation.
+
+This is not the browser's built-in pop-up. It is an accessible dialog from the kit.
+
+It works with the keyboard, it traps focus, and it can be styled.
+
+Escape cancels.
+
+...
+
+Confirm, and the note is gone.
+
+## 9 am_eric
+Now, access for programs. Programs need to reach the app without a browser. So the app can create API tokens.
+
+First we sign in from the command line, to get a cookie.
+
+[pause 2.5]
+
+Then we ask for a token. A read-only one.
+
+[pause 1.5]
+
+Here it is. It is shown once. Only its fingerprint is stored.
+
+Now we use it to read the notes.
+
+[pause 1.5]
+
+Reading works.
+
+Now we try to write.
+
+[pause 1.5]
+
+Refused. The token's scope does not grant that permission.
+
+One more try. A write from a browser session, without the special header.
+
+[pause 1.5]
+
+Refused too. That header defends against another website tricking your browser into acting for you.
+
+The kit's middleware checks it for you.
+
+## 10 af_sarah
+What happens when the server restarts?
+
+We stop it, and start it again.
+
+[pause 2.5]
+
+Now we reload the browser.
+
+The screen says the keys are locked. The encryption key only lives in memory. So after a restart, the vault is locked.
+
+Type the admin password, and it opens again.
+
+[pause 2.0]
+
+Now the better way. Give the server a platform key.
+
+[pause 2.5]
+
+That is a secret your deployment platform stores.
+
+[pause 1.0]
+
+Unlock once with the password. That adds the platform key as a second way in.
+
+[pause 2.0]
+
+Restart one more time.
+
+[pause 2.5]
+
+And this time, there is no banner. The secret note is readable at once.
+
+From now on, restarts need no one.
+
+## 11 af_sarah
+Now, a recap. That is the whole app.
+
+In a few hundred lines we have first-run setup, a login, and roles. We also have encrypted secrets, API tokens, and a consistent interface.
+
+All of it came from the kit.
+
+...
+
+To go further, read the guide. Section six is the walkthrough. Section seven covers the blocks. Section ten covers operations.
+
+Want single sign-on? Set one variable that points at your identity provider.
+
+Want to deploy? Add your app to the ecosystem manifest, and let the deployment tool put it on AgentPG.
+
+Clone the repository, copy the Notes example, and build your own.

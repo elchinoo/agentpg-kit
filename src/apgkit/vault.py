@@ -43,6 +43,7 @@ class Vault:
         self.env_prefix = env_prefix.upper()
         self._lock = threading.Lock()
         self._data_key: bytes | None = None
+        self._env_ok: bool | None = None     # did the current platform secret open the stored wrap? None = not tried yet
 
     def _env_secret(self) -> str:
         return read_secret(f"{self.env_prefix}_ENCRYPTION_KEY", f"/etc/{self.env_prefix.lower()}/encryption_key")
@@ -58,7 +59,7 @@ class Vault:
             return None
         try:
             return _kdf(secret, base64.b64decode(salt)).decrypt(wrapped.encode())
-        except InvalidToken:
+        except (InvalidToken, ValueError):      # wrong secret, or a damaged wrap: fail closed
             return None
 
     def is_initialized(self, conn) -> bool:
@@ -72,8 +73,17 @@ class Vault:
             self._data_key = None
 
     def status(self, conn) -> dict:
+        """`auto_unlock` is True when a platform secret is set and a wrap for it is stored (the platform is expected to open the vault; when it cannot, `reason` is `platform_key_mismatch`). `reason` says why a
+        locked vault is locked (None when unlocked): `not_initialized`, `no_platform_key`, `no_platform_wrap` or
+        `platform_key_mismatch` (the key changed: unlock once with the admin password to re-wrap)."""
+        env, wrapped = bool(self._env_secret()), store.get(conn, _K_ENV) is not None
+        reason = None
+        if not self.is_unlocked():
+            reason = ("not_initialized" if not self.is_initialized(conn) else "no_platform_key" if not env
+                      else "no_platform_wrap" if not wrapped else "platform_key_mismatch" if self._env_ok is False
+                      else "locked")
         return {"initialized": self.is_initialized(conn), "unlocked": self.is_unlocked(),
-                "auto_unlock": bool(self._env_secret()) and store.get(conn, _K_ENV) is not None}
+                "auto_unlock": env and wrapped, "reason": reason}
 
     def initialize(self, conn, password: str) -> None:
         """Create the data key, wrapped under the password (and the platform secret, if configured). Unlocks."""
@@ -82,6 +92,7 @@ class Vault:
         env = self._env_secret()
         if env:
             self._wrap(conn, env, _K_ENV_SALT, _K_ENV, data_key)
+            self._env_ok = True
         with self._lock:
             self._data_key = data_key
 
@@ -95,6 +106,7 @@ class Vault:
         self._wrap(conn, env, _K_ENV_SALT, _K_ENV, data_key)
         with self._lock:
             self._data_key = data_key
+        self._env_ok = True
         return True
 
     def unlock_with_password(self, conn, password: str) -> bool:
@@ -103,18 +115,30 @@ class Vault:
             return False
         with self._lock:
             self._data_key = key
-        env = self._env_secret()
-        if env and store.get(conn, _K_ENV) is None:      # a platform secret was added later: wrap it for auto-unlock
-            self._wrap(conn, env, _K_ENV_SALT, _K_ENV, key)
+        self._sync_platform_wrap(conn, key)
         return True
+
+    def _sync_platform_wrap(self, conn, key: bytes) -> None:
+        """Keep the platform-secret wrap current: add it if missing, replace it if the secret changed (the caller has proven
+        it holds the data key by unlocking with the password). Never raises: the password unlock has already succeeded."""
+        env = self._env_secret()
+        if not env:
+            return
+        try:
+            if self._unwrap(conn, env, _K_ENV_SALT, _K_ENV) != key:
+                self._wrap(conn, env, _K_ENV_SALT, _K_ENV, key)
+            self._env_ok = True
+        except Exception:                                  # a failed re-wrap leaves the old wrap; the password still works
+            self._env_ok = False
 
     def try_unlock_with_platform_secret(self, conn) -> bool:
         env = self._env_secret()
         if not env:
             return False
         key = self._unwrap(conn, env, _K_ENV_SALT, _K_ENV)
+        self._env_ok = key is not None
         if key is None:
-            return False
+            return False                                   # fail closed: stay locked, status() says why
         with self._lock:
             self._data_key = key
         return True

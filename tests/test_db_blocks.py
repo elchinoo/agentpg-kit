@@ -76,6 +76,81 @@ def test_vault_platform_secret_unlocks_after_restart(db, tmp_path, monkeypatch):
         assert not v.try_unlock_with_platform_secret(c)
 
 
+def _vault_state(c):
+    return settings_store.get(c, "vault_wrap_env"), settings_store.get(c, "vault_env_salt")
+
+
+def test_vault_first_wrap_and_status_reason(db, tmp_path, monkeypatch):
+    migrate.run(db, tmp_path)
+    monkeypatch.delenv("DEMO_ENCRYPTION_KEY", raising=False)
+    monkeypatch.setenv("DEMO_ENCRYPTION_KEY_FILE", str(tmp_path / "none"))
+    v = Vault("demo")
+    with db.connect() as c:
+        assert v.status(c)["reason"] == "not_initialized"
+        v.initialize(c, "a long enough password")
+        c.commit()
+        assert _vault_state(c) == (None, None) and v.status(c)["reason"] is None
+        token = v.encrypt("hello")
+        v.lock()
+        assert v.status(c)["reason"] == "no_platform_key" and not v.status(c)["auto_unlock"]
+        monkeypatch.setenv("DEMO_ENCRYPTION_KEY", "first-platform-key-value")
+        assert v.status(c)["reason"] == "no_platform_wrap"
+        assert not v.try_unlock_with_platform_secret(c) and not v.is_unlocked()
+        assert v.unlock_with_password(c, "a long enough password")      # first wrap
+        c.commit()
+        assert all(_vault_state(c)) and v.status(c)["auto_unlock"]
+        v.lock()
+        assert v.try_unlock_with_platform_secret(c) and v.decrypt(token) == "hello"
+
+
+def test_vault_rotated_platform_key_is_rewrapped_by_password_unlock(db, tmp_path, monkeypatch):
+    migrate.run(db, tmp_path)
+    monkeypatch.setenv("DEMO_ENCRYPTION_KEY", "old-platform-key-value")
+    v = Vault("demo")
+    with db.connect() as c:
+        v.initialize(c, "a long enough password")
+        c.commit()
+        token = v.encrypt("hello")
+        old_wrap = _vault_state(c)
+        v.lock()
+        monkeypatch.setenv("DEMO_ENCRYPTION_KEY", "new-platform-key-value")
+        v = Vault("demo")                                            # a restarted process with the new key
+        assert not v.try_unlock_with_platform_secret(c) and not v.is_unlocked()
+        st = v.status(c)
+        assert st["reason"] == "platform_key_mismatch" and st["auto_unlock"] and not st["unlocked"]
+        with pytest.raises(VaultLocked):
+            v.decrypt(token)
+        assert v.unlock_with_password(c, "a long enough password")
+        c.commit()
+        assert _vault_state(c) != old_wrap and v.status(c)["auto_unlock"]
+        v = Vault("demo")                                            # restart again: auto-unlock now works
+        assert v.try_unlock_with_platform_secret(c) and v.decrypt(token) == "hello"
+        assert v.status(c)["reason"] is None
+
+
+def test_vault_auto_unlock_with_wrong_or_damaged_wrap_fails_closed(db, tmp_path, monkeypatch):
+    migrate.run(db, tmp_path)
+    monkeypatch.setenv("DEMO_ENCRYPTION_KEY", "platform-managed-secret-value")
+    v = Vault("demo")
+    with db.connect() as c:
+        v.initialize(c, "a long enough password")
+        c.commit()
+        wrap = _vault_state(c)
+        v.lock()
+        monkeypatch.setenv("DEMO_ENCRYPTION_KEY", "some-other-key-entirely")
+        assert not v.try_unlock_with_platform_secret(c) and not v.is_unlocked()
+        assert v.status(c)["reason"] == "platform_key_mismatch"
+        assert _vault_state(c) == wrap                               # nothing was weakened or overwritten
+        monkeypatch.setenv("DEMO_ENCRYPTION_KEY", "platform-managed-secret-value")
+        settings_store.put(c, "vault_env_salt", "!!not base64!!")    # a damaged wrap must not raise
+        v2 = Vault("demo")
+        assert not v2.try_unlock_with_platform_secret(c) and not v2.is_unlocked()
+        assert v2.unlock_with_password(c, "a long enough password")  # and the password path heals it
+        c.commit()
+        v2.lock()
+        assert v2.try_unlock_with_platform_secret(c)
+
+
 APP = AppAuth("demo", "demo-client", role_permissions={"admin": frozenset({"*"}), "viewer": frozenset({"things:read"})},
               scope_permissions={"read": frozenset({"things:read"}), "full": frozenset({"*"})})
 

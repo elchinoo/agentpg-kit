@@ -3,6 +3,8 @@
 The small, reusable blocks that every app in the AgentPG ecosystem is built from, so an app is its own logic and not a copy
 of the same vault, auth and middleware again. Import name: `apgkit`.
 
+**Documentation:** [docs/GUIDE.md](docs/GUIDE.md) (purpose, ecosystem, architecture, install, configuration, first-run walkthrough, operations) and [docs/VIDEO-SCRIPT.md](docs/VIDEO-SCRIPT.md) (tutorial: build a new app in 10 minutes). The runnable tutorial app is in [docs/examples/notes](docs/examples/notes).
+
 | Block | What it gives you |
 |---|---|
 | `apgkit.config` | `read_secret` (env, or a file named by `<ENV>_FILE`), `database_url` (the three DSN variables AgentPG may set), `env_bool` |
@@ -127,6 +129,11 @@ pytest -q
 ```
 
 ## Changelog
+
+### 0.3.0
+- New: `apgkit.insights` (query insights from `edb_stat_monitor`, `pg_stat_statements`, `edb_pg_tuner`, `query_advisor`; every source degrades to `{"available": false, "reason"}`), `metrics.add_insights_collector` (small-cardinality gauges), shared `static/insights.js` (`initInsights(root, api)`) and `apgkit.masking` (database-enforced masking views for the AgentPG read-only role `a1p_readonly`).
+- New: `migrate.run(..., after_migrate=[hook, ...])`, hooks run on every call after the migrations commit (backward compatible; default empty).
+- Docs: GUIDE sections 7.10 and 7.11 with the verified facts and limitations.
 
 ### 0.2.5
 - Fix: `confirmDialog()`/`promptDialog()` could not be clicked or typed into while an app had a modal `<dialog>` open via `showModal()` (PayBroker merchant window, ShopFront order window): the old `popover="manual"` overlay was inert there. The shared modal is now a native `<dialog role="alertdialog">` opened with `showModal()`, which stacks above an earlier modal dialog. Same API and behaviour (focus trap/restore, Escape and backdrop cancel, typeToConfirm, validation, queueing, scroll lock); fallback for browsers without `showModal()`. CSS: `.confirm-overlay` is replaced by `dialog.confirm-dialog` and its `::backdrop`; apps styling `.confirm-overlay` must update.

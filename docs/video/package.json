@@ -1,0 +1,12 @@
+{
+  "name": "apgkit-video-recorder",
+  "private": true,
+  "description": "Plays docs/VIDEO-SCRIPT.md in a real browser against a local throwaway Postgres and records it. Local only.",
+  "scripts": {
+    "record": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@types/node": "26.6.5"
+  }
+}

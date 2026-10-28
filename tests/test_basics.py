@@ -248,3 +248,19 @@ def test_empty_chat_answer_with_reasoning_only_and_without_metadata():
     with pytest.raises(LLMError, match="unexpected response"):
         _chat_answer({"nothing": True})
     assert _chat_answer({"choices": [{"message": {"content": " OK "}}], "usage": {"x": 1}})["text"] == "OK"
+
+
+def test_version_is_single_sourced():
+    import importlib.metadata
+    import re
+    import tomllib
+    from pathlib import Path
+
+    import apgkit
+    meta = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text())["project"]
+    assert "version" not in meta and "version" in meta["dynamic"]            # pyproject reads src/apgkit/__init__.py
+    assert re.fullmatch(r"\d+\.\d+\.\d+", apgkit.__version__)
+    try:
+        assert importlib.metadata.version("agentpg-kit") == apgkit.__version__
+    except importlib.metadata.PackageNotFoundError:
+        pass
