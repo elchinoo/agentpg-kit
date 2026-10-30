@@ -6,6 +6,7 @@ The app then starts its own server-side session from them. Roles and name come f
 """
 import base64
 import hashlib
+import hmac
 import secrets
 from collections.abc import Callable
 from urllib.parse import urlencode
@@ -74,7 +75,7 @@ class RelyingParty:
         if not id_token:
             raise TokenError("the identity provider returned no ID token")
         claims = self._id_verifier.verify(id_token)
-        if claims.get("nonce") != row["nonce"]:
+        if not isinstance(claims.get("nonce"), str) or not hmac.compare_digest(claims["nonce"].encode(), str(row["nonce"]).encode()):
             raise TokenError("the ID token does not belong to this login attempt")
         return claims, row["return_to"], id_token
 

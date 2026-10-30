@@ -76,6 +76,8 @@ class LocalAuth:
         stored = store.get(conn, _K_ADMIN)
         if stored is None or not passwords.verify_password(password, stored):
             return False
+        if passwords.needs_rehash(stored):                # hashed with weaker parameters: upgrade it now that the password is in hand
+            store.put(conn, _K_ADMIN, passwords.hash_password(password))
         if self.vault:
             self.vault.unlock_with_password(conn, password)
         conn.commit()

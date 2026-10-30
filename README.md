@@ -130,6 +130,10 @@ pytest -q
 
 ## Changelog
 
+### 0.4.0
+- New: `Vault.rotate_data_key(conn, reencrypt=None, password=...)` (new data key, re-encryption of every stored secret and both wraps in one transaction), `Vault.rotate_platform_secret`, `Vault.drop_platform_wrap`, and a store registry (`register_store`, `stores`). See GUIDE 7.3.1.
+- Hardening: scrypt N=2^17 for new vault wraps and new password hashes; parameters are stored per wrap and legacy wraps and hashes still verify and are upgraded on next use. Constant-time comparison of the OIDC nonce and the vault key check. Documented admin-password-only mode (GUIDE 7.3.2); defaults unchanged.
+
 ### 0.3.1
 - Fix: the insights index suggestions no longer list dropped columns (`........pg.dropped.N........`), columns that already lead a valid index or primary key, or rows without a suggestion. `advisor()` adds `summary: {"already_indexed": N}` (additive; existing keys unchanged) and `insights.js` shows "N suggestions hidden: column already indexed." and a plainer message when statement texts are hidden (the role needs `pg_read_all_stats`). Apps only need to raise their kit pin for this.
 - New: `masking.deny_tables(conn, tables, readonly_role)` (revoke-only helper, idempotent, skips missing tables), `masking.drift(...)`, and `masking.reassert_forever(connect, apply, every=300, ...)` (+ `reassert_tick`, `status`), a lifespan loop that re-applies the app's masking because `agentpg db-users create` and default privileges re-grant SELECT on base tables after startup. Metrics `masking_last_ok_timestamp`, `masking_reapplied_total`, `masking_drift_tables`. See GUIDE 7.11.

@@ -1,6 +1,6 @@
 # agentpg-kit guide
 
-Version described: **0.3.1** (`apgkit.__version__` is the single source; `pyproject.toml` reads it). Everything below was checked against the
+Version described: **0.4.0** (`apgkit.__version__` is the single source; `pyproject.toml` reads it). Everything below was checked against the
 source in `src/apgkit`, the tests in `tests/`, and the way the other projects of the ecosystem use the kit. Where a statement could
 not be verified it is listed under [Known limitations](#13-known-limitations-and-things-not-verified).
 
@@ -439,6 +439,76 @@ pool = db.pool()                                # hot paths: ConnectionPool; use
   unlocks it, `change_password` re-wraps it, `reset_admin` resets it and calls your `on_reset(conn)` hook to delete whatever was
   encrypted (it would be unreadable).
 
+#### 7.3.1 Rotating the data key, and the other vault operations (since 0.4.0)
+
+**Why re-wrapping is not enough.** `change_password`, `rotate_platform_secret` and changing `<PREFIX>_ENCRYPTION_KEY` re-wrap the
+SAME 32-byte data key. Anyone who copied the database (and so the old wrap rows) and who holds the old password or platform
+secret still recovers that key, and with it every ciphertext copied at the same time. Only `rotate_data_key` replaces the key.
+
+`Vault.rotate_data_key(conn, reencrypt=None, *, password=None) -> dict[str, int]`:
+
+1. requires the vault unlocked and `conn` idle (no open transaction); `password` is required when a password wrap exists (it is
+   verified first) because that wrap is rewritten;
+2. generates a new data key (`secrets.token_bytes(32)`);
+3. inside ONE transaction on `conn`: re-encrypts the registered stores (below) and calls `reencrypt(old_decrypt, new_encrypt)` for
+   anything else, then rewrites the password wrap and (when `<PREFIX>_ENCRYPTION_KEY` is set) the platform wrap with the new key; if
+   no platform secret is set, a stored platform wrap is deleted because it would still open the old key;
+4. commits, and only then switches the in-memory key.
+
+Crash safety: before the commit nothing is visible. An exception (including one raised by your callback), a crash or a lost
+connection leaves the old key, the old ciphertexts and the old wraps exactly as they were (tested, including a failure while
+writing the platform wrap). After the commit all of them are new. If the connection dies during the commit itself the outcome is
+unknown, so the vault locks itself; unlock again and you get whichever key won. A value that cannot be decrypted aborts the
+rotation; decide in your callback whether to skip or null it.
+
+Operational rules: stop writers of vault-encrypted columns during the call (use `LOCK TABLE ... IN SHARE ROW EXCLUSIVE MODE` in
+the callback); other processes of the same app keep the old key in memory and cannot decrypt until restarted or unlocked again, so
+restart them right after; old backups keep decrypting with the old key, so after an exposure you must also re-issue the secrets
+themselves at their source.
+
+Stores registry: `vault.register_store(name, select_sql, update_sql)` declares where an app keeps ciphertexts. `select_sql` returns
+one row per ciphertext, the ciphertext in a column named `value` plus any columns that identify the row; `update_sql` uses named
+parameters, `%(value)s` and one `%(<column>)s` per identifying column. Example:
+
+```python
+vault.register_store("provider.api_key",
+    "SELECT id, api_key_enc AS value FROM provider WHERE api_key_enc IS NOT NULL",
+    "UPDATE provider SET api_key_enc = %(value)s WHERE id = %(id)s")
+...
+with db.connect() as conn:            # idle connection
+    counts = vault.rotate_data_key(conn, password=admin_password)    # {"provider.api_key": 3}
+```
+
+`vault.stores()` lists what is registered (useful in a test that fails when a new encrypted column is not registered).
+
+Other operations: `rotate_platform_secret(conn, new_secret)` (unlocked; also set the new value in the platform's environment);
+`drop_platform_wrap(conn)` (switch to admin-password-only mode; refuses when it is the only wrap).
+
+**KDF parameters.** Each wrap stores its parameters next to its salt (`vault_kdf_pw`, `vault_kdf_env`, `scrypt$17$8$1`). New wraps
+use N=2^17, r=8, p=1 (128 MiB, about 0.3 s); `maxmem` is 256 MiB for every derivation. Wraps without stored parameters are legacy
+(N=2^15) and still open. Migration happens on use: a password sign-in upgrades the password wrap, the platform-secret unlock at
+start upgrades the platform wrap (that one commits on the connection it is given). A kit older than 0.4.0 cannot open an upgraded
+wrap: roll back only before the first unlock, or unlock once after rolling back with a restore of the settings rows.
+
+#### 7.3.2 Admin-password-only mode (stronger, optional; not the default)
+
+Do not set `<PREFIX>_ENCRYPTION_KEY` (nor `_FILE`, nor `/etc/<prefix>/encryption_key`). `initialize(conn, password)` then wraps the
+data key under the admin password alone, and no platform wrap exists (tested: `test_admin_password_only_mode`). To move an existing
+app: unset the variable first (otherwise a password unlock re-adds the platform wrap), then `drop_platform_wrap(conn)`, and if the
+old platform secret may be exposed, run `rotate_data_key` as well.
+
+What you gain: the database plus the environment no longer open the vault; the attacker needs the admin password (guessed offline
+at the scrypt cost above) or a running unlocked process. What you lose:
+
+- **No unattended restarts.** After any restart, recreate or crash the vault is locked (`status(conn)["reason"] == "no_platform_key"`)
+  until a human signs in with the admin password. Everything that needs a stored secret answers `VaultLocked` meanwhile: outbound
+  calls with stored provider keys, webhook delivery and workers, and, for an identity provider, token signing for the whole fleet.
+- **No SSO-only deployments.** `initialize_with_platform_secret` returns False; the vault needs a local admin password.
+- The admin password becomes a high-value secret (it also opens the vault); losing it loses the vault (`reset_admin`).
+- While unlocked, the data key is in process memory: a shell inside the running process still gets it.
+
+The default (platform secret set) is unchanged.
+
 ### 7.4 Authentication
 
 `AppAuth(name, audience, role_permissions, scope_permissions)` declares the model; `Principal.can("x:y")` is the only check code
@@ -694,14 +764,15 @@ that app's `core.py`.
 
 ## 9. Security notes
 
-- **Passwords**: scrypt (N=2^15, r=8, p=1, 16-byte salt), stored as one string with its parameters; 12 to 256 characters.
+- **Passwords**: scrypt (N=2^17, r=8, p=1, 16-byte salt: OWASP's first scrypt choice in its Password Storage Cheat Sheet), stored as one string with its parameters; 12 to 256 characters. Hashes made with older parameters still verify and are upgraded at the next successful sign-in (`LocalAuth.login_password`); parameters read from storage are bounded so a damaged row cannot demand unbounded memory.
 - **Sessions, tokens, keys**: only SHA-256 hashes of session cookies and API tokens are stored; tokens are shown once at creation
   and are revocable; static key compared with `hmac.compare_digest`.
+- **Comparisons and logs**: static keys, setup codes, password digests, vault key checks and the OIDC nonce use `hmac.compare_digest`; secrets never appear in log lines or exception messages (the LLM client redacts its key from provider errors; vault errors carry fixed text).
 - **Setup code**: 12 characters from an alphabet without look-alikes, held in process memory, printed to the server log. Whoever
   can read the log can create the admin password; completion is refused once an admin exists. It **changes on every restart**
   until setup completes.
 - **Vault**: a random 32-byte data key encrypts secrets with Fernet (AES-128-CBC + HMAC-SHA256). The data key is stored only wrapped
-  (under a scrypt-derived key from the admin password, and/or from the platform secret). The unwrapped key exists only in process
+  (under a scrypt-derived key from the admin password, and/or from the platform secret; each wrap records its own scrypt parameters, N=2^17 for new wraps, and a legacy N=2^15 wrap is upgraded the next time its secret is presented). The unwrapped key exists only in process
   memory. A database dump alone cannot decrypt; **a dump plus the admin password, or plus the platform secret, can.**
 - **Token verification**: algorithm allow-list (`none` and HMAC refused, closing key confusion), mandatory issuer, audience, expiry,
   subject; JWKS from the discovered `jwks_uri`; the discovery document's `issuer` must equal the configured one.
@@ -736,8 +807,8 @@ migrates, tries the platform secret, and otherwise shows the vault banner for th
 | What | How | Verified |
 |---|---|---|
 | Admin password | `LocalAuth.change_password(conn, current, new)` (apps expose it; CityPulse also deletes all `web_session` rows afterwards). The vault data key is **re-wrapped**, not changed, so stored secrets stay readable. | yes: old password refused, new accepted, old ciphertext still decrypts |
-| Platform secret (`<PREFIX>_ENCRYPTION_KEY`) | Set the new value and restart. Auto-unlock with the old wrap now fails closed: the vault stays locked, `try_unlock_with_platform_secret` returns False and `Vault.status(conn)` keeps `"auto_unlock": true` (a platform key and a wrap exist, so apps report a vault that should open but cannot, for example `/readyz` 503) and reports `"reason": "platform_key_mismatch"` (other reasons: `not_initialized`, `no_platform_key`, `no_platform_wrap`, `locked`). The admin then unlocks with the password (`unlock_with_password`, which `LocalAuth.login_password` calls); the kit notices that the platform wrap is missing or does not open with the current key and **re-wraps the data key under the new secret automatically**. The next restart auto-unlocks. A wrong or damaged wrap never raises and never overwrites anything until a password unlock succeeds. No manual SQL is needed. | yes (tests `test_vault_*` in `tests/test_db_blocks.py`) |
-| Vault data key | no helper exists. `Vault.reset(conn)` forgets the key and every wrap: everything encrypted becomes unreadable and the app must delete it (the `on_reset` hook). | by reading code |
+| Platform secret (`<PREFIX>_ENCRYPTION_KEY`) | `Vault.rotate_platform_secret(conn, new_secret)` while unlocked (re-wrap only: NOT sufficient after exposure, see 7.3.1), or set the new value and restart. Auto-unlock with the old wrap now fails closed: the vault stays locked, `try_unlock_with_platform_secret` returns False and `Vault.status(conn)` keeps `"auto_unlock": true` (a platform key and a wrap exist, so apps report a vault that should open but cannot, for example `/readyz` 503) and reports `"reason": "platform_key_mismatch"` (other reasons: `not_initialized`, `no_platform_key`, `no_platform_wrap`, `locked`). The admin then unlocks with the password (`unlock_with_password`, which `LocalAuth.login_password` calls); the kit notices that the platform wrap is missing or does not open with the current key and **re-wraps the data key under the new secret automatically**. The next restart auto-unlocks. A wrong or damaged wrap never raises and never overwrites anything until a password unlock succeeds. No manual SQL is needed. | yes (tests `test_vault_*` in `tests/test_db_blocks.py`) |
+| Vault data key | `Vault.rotate_data_key(conn, reencrypt=None, password=...)`: new random key, every stored secret re-encrypted and both wraps rewritten in ONE transaction (section 7.3.1). Re-wrapping alone (platform secret, admin password) does not change the data key. `Vault.reset(conn)` forgets the key and every wrap: everything encrypted becomes unreadable and the app must delete it (the `on_reset` hook). | yes (tests in `tests/test_vault_hardening.py`) |
 | Local API token | create a new token, switch clients, `LocalAuth.revoke_token(conn, id)`. With `token_cache_seconds > 0`, other processes honour a revoked token for up to that long; call `forget_tokens()`. | yes (test) |
 | Static key | change the env value or file, restart. | by reading code |
 | Identity signing keys | handled by identity; consumers re-fetch JWKS on an unknown `kid` (once per 15 s) with no restart. | yes (test) |
