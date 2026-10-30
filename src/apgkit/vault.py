@@ -92,20 +92,23 @@ _URLSAFE_RE = re.compile(r"[A-Za-z0-9_-]{43,}={0,2}")
 
 
 def is_high_entropy(secret: str) -> bool:
-    """True when `secret` looks like a machine-generated key, for which a slow KDF adds nothing: at least 32 bytes after
-    base64 (standard or url-safe) or hex decoding, or at least 43 url-safe characters (43 characters carry 256 bits), and not
-    visibly repetitive (at least 16 distinct characters). Anything else is treated as a human password and keeps scrypt."""
-    if len(set(secret)) < 16:
-        return False
-    if _URLSAFE_RE.fullmatch(secret):
-        return True
-    for decode in (lambda t: base64.b64decode(t, validate=True), lambda t: base64.urlsafe_b64decode(t + "=" * (-len(t) % 4)), bytes.fromhex):
+    """True when `secret` looks like a machine-generated key, for which a slow KDF adds nothing. A secret that decodes (base64,
+    url-safe base64 or hex) must give at least 32 bytes with at least 16 distinct byte values (32 random bytes have about 28; a
+    repeated or low-variety passphrase fails). A secret that does not decode keeps the length rule (at least 43 url-safe
+    characters, which carry 256 bits) and needs at least 16 distinct characters. Anything else is a human password: scrypt."""
+    try:
+        raw = bytes.fromhex(secret)                    # hex first: its characters are also valid base64, which would decode to noise
+    except ValueError:
+        pass
+    else:
+        return len(raw) >= 32 and len(set(raw)) >= 16
+    for decode in (lambda t: base64.b64decode(t, validate=True), lambda t: base64.urlsafe_b64decode(t + "=" * (-len(t) % 4))):
         try:
-            if len(decode(secret)) >= 32:
-                return True
+            raw = decode(secret)
         except ValueError:
             continue
-    return False
+        return len(raw) >= 32 and len(set(raw)) >= 16
+    return bool(_URLSAFE_RE.fullmatch(secret)) and len(set(secret)) >= 16
 
 
 def _hkdf(key: bytes, info: bytes, salt: bytes | None = None, length: int = 32) -> bytes:

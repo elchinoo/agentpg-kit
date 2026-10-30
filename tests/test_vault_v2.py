@@ -89,12 +89,24 @@ def test_legacy_fernet_still_decrypts_and_reencrypt_legacy_upgrades():
 
 def test_is_high_entropy_rule():
     assert is_high_entropy(RANDOM_ENV)
-    assert is_high_entropy(base64.b64encode(secrets.token_bytes(32)).decode())               # standard base64 with padding and +/
-    assert is_high_entropy(secrets.token_hex(32))
+    assert is_high_entropy("Zx3_9qLmT-0vBn7QwErTyUiOpAsDfGhJkLzXcVbNm1Y")                  # 43 url-safe characters
+    assert is_high_entropy(base64.b64encode(bytes(range(32))).decode())                      # standard base64 with padding
+    assert is_high_entropy(bytes(range(32)).hex())                                           # hex: only 16 characters, but 32 distinct bytes
+    assert is_high_entropy(bytes(range(40, 72)).hex().upper())
     assert not is_high_entropy(HUMAN_ENV)
     assert not is_high_entropy("correct-horse-battery-staple-correct-horse")                  # long but a phrase
-    assert not is_high_entropy(base64.urlsafe_b64encode(secrets.token_bytes(24)).decode())     # 24 bytes: below 32
+    assert not is_high_entropy(base64.urlsafe_b64encode(bytes(range(24))).decode())            # 24 bytes: below 32
     assert not is_high_entropy("A" * 60)
+    assert not is_high_entropy(("0123456789abcdef" * 4)[:64])                                # hex of 32 bytes with only 8 distinct values
+    assert not is_high_entropy(base64.urlsafe_b64encode(b"abcd" * 16).decode())              # repeated bytes
+    assert not is_high_entropy("a1" * 40)                                                     # undecodable, few distinct characters
+
+
+def test_is_high_entropy_accepts_random_machine_secrets():
+    for _ in range(200):
+        assert is_high_entropy(secrets.token_hex(32))
+        assert is_high_entropy(secrets.token_urlsafe(32))
+        assert is_high_entropy(base64.b64encode(secrets.token_bytes(32)).decode())
 
 
 # ---- database: wraps, rotation ----------------------------------------------------------------------------------------
