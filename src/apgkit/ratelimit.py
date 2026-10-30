@@ -46,6 +46,17 @@ class FailureLimiter:
             if len(self._failures) > self.max_clients:
                 self._evict(now)
 
+    def forgive(self, client: str) -> None:
+        """Take back this client's most recent recorded failure (an attempt that succeeded, or was never judged). Forgetting a
+        client with no failures is a no-op; a client left with none is removed from the table."""
+        with self._lock:
+            times = self._failures.get(client)
+            if not times:
+                return
+            times.pop()
+            if not times:
+                del self._failures[client]
+
     def clear(self) -> None:
         with self._lock:
             self._failures.clear()

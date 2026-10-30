@@ -185,10 +185,18 @@ def test_setup_flow_and_password_login(db, tmp_path, monkeypatch):
 
 def test_static_key_disables_the_setup_flow(db, tmp_path, monkeypatch):
     a = local(db, tmp_path, monkeypatch)
-    monkeypatch.setenv("DEMO_API_KEY", "static-key-value")
+    monkeypatch.setenv("DEMO_API_KEY", "k" * 32)
     with db.connect() as c:
-        assert not a.needs_setup(c) and a.static_key_configured()
-    assert a.static_key_matches("static-key-value") and not a.static_key_matches("static-key-valuf")
+        assert not a.needs_setup(c) and a.static_key_configured() and a.static_key_usable()
+    assert a.static_key_matches("k" * 32) and not a.static_key_matches("k" * 31 + "x")
+
+
+def test_a_refused_static_key_does_not_close_first_run_setup(db, tmp_path, monkeypatch):
+    a = local(db, tmp_path, monkeypatch)
+    monkeypatch.setenv("DEMO_API_KEY", "static-key-value")                  # shorter than 32: refused everywhere
+    with db.connect() as c:
+        assert a.static_key_configured() and not a.static_key_usable()
+        assert a.needs_setup(c)
 
 
 def test_sessions_local_admin_and_federated_user(db, tmp_path, monkeypatch):

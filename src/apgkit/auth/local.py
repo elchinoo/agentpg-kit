@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import HTTPException
 
-from .. import passwords
+from .. import config, passwords
 from .. import settings_store as store
 from ..config import read_secret
 from ..ids import sha256
@@ -55,8 +55,14 @@ class LocalAuth:
     def admin_configured(self, conn) -> bool:
         return store.get(conn, _K_ADMIN) is not None
 
+    def static_key_usable(self) -> bool:
+        """True when a static key is configured AND acceptable (a key shorter than the minimum is refused everywhere)."""
+        key = self.static_key()
+        return bool(key) and config.static_key_problem(key) is None
+
     def needs_setup(self, conn) -> bool:
-        return not self.admin_configured(conn) and not self.static_key_configured()
+        """First-run setup is still open: no admin password and no usable static key (a refused, too-short key does not count)."""
+        return not self.admin_configured(conn) and not self.static_key_usable()
 
     def complete_setup(self, conn, code: str, password: str) -> None:
         if self.admin_configured(conn):
@@ -91,16 +97,7 @@ class LocalAuth:
     @staticmethod
     def _release_attempt(limiter, client: str | None) -> None:
         """Give the reserved slot back (the attempt succeeded, or never reached the hash)."""
-        forgive = getattr(limiter, "forgive", None)
-        if forgive is not None:
-            forgive(client)
-            return
-        try:                                       # a limiter without `forgive`: drop this client's newest entry
-            with limiter._lock:
-                if limiter._failures.get(client):
-                    limiter._failures[client].pop()
-        except AttributeError:
-            pass
+        limiter.forgive(client)
 
     def _check_password(self, conn, password: str, stored: str) -> bool:
         """Verify the admin password with ONE scrypt derivation. When the app has a vault with a password wrap, the wrap IS the

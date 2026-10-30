@@ -302,3 +302,16 @@ def test_static_key_needs_32_characters_and_warns_at_startup(monkeypatch, caplog
     with caplog.at_level(logging.WARNING, logger="apgkit.auth"):
         Authenticator(APP, LocalAuth(APP, env_prefix="DEMO", token_prefix="dm_", token_scopes=set()), None, cookie_name="s")
     assert not caplog.records                                                      # no key, no noise
+
+
+def test_failure_limiter_forgive_removes_the_newest_failure_only():
+    from apgkit.ratelimit import FailureLimiter
+    lim = FailureLimiter(limit=2)
+    lim.record("a"), lim.record("a"), lim.record("b")
+    assert lim.limited("a") and not lim.limited("b")
+    lim.forgive("a")
+    assert not lim.limited("a") and len(lim._failures["a"]) == 1
+    lim.forgive("a")
+    assert "a" not in lim._failures                                   # no failures left: no entry
+    lim.forgive("a"), lim.forgive("never-seen")                       # no-ops
+    assert "b" in lim._failures and "never-seen" not in lim._failures
