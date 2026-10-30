@@ -16,7 +16,17 @@ from apgkit.auth.local import LocalAuth
 from apgkit.auth.principal import AppAuth
 from apgkit.auth.schema import SQL as AUTH_SQL
 from apgkit.ratelimit import FailureLimiter
-from apgkit.vault import KDF_HKDF, KDF_LEGACY, Vault, VaultError, _b64, _kdf, is_high_entropy
+from apgkit.vault import (
+    KDF_HKDF,
+    KDF_LEGACY,
+    Vault,
+    VaultError,
+    VaultLocked,
+    _b64,
+    _kdf,
+    is_high_entropy,
+    legacy_decrypt_fallback,
+)
 
 PW = "a long enough password"
 RANDOM_ENV = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")      # what our tooling generates
@@ -390,3 +400,70 @@ def test_successful_login_is_forgiven_and_busy_returns_the_slot(local, monkeypat
                 la.login_password(c, PW, client="c", limiter=limiter)
         assert not limiter.limited("c")                                       # no password was judged: nothing counted
         passwords.set_concurrency(None)
+
+
+# ---- register_setting and legacy_decrypt_fallback ------------------------------------------------------------------------
+@needs_db
+def test_register_setting_rotates_an_app_setting_under_its_context(setup):
+    v = Vault("demo")
+    assert v.register_setting("llm_key") == "app_setting.llm_key"
+    assert v.stores()["app_setting.llm_key"]["context"] == "app_setting.llm_key"
+    with setup.connect() as c:
+        v.initialize(c, PW)
+        settings_store.put(c, "llm_key", v.encrypt("sk-secret", "app_setting.llm_key"))
+        c.commit()
+        before = settings_store.get(c, "llm_key")
+        c.commit()                                                       # rotate_data_key needs an idle connection
+        assert v.rotate_data_key(c, password=PW) == {"app_setting.llm_key": 1}
+        after = settings_store.get(c, "llm_key")
+        assert after != before and v.decrypt(after, "app_setting.llm_key") == "sk-secret"
+        with pytest.raises(VaultError):
+            v.decrypt(after, "app_setting.other")
+
+
+@needs_db
+def test_register_setting_skips_a_missing_key_and_leaves_others_alone(setup):
+    v = Vault("demo")
+    v.register_setting("absent")
+    with setup.connect() as c:
+        v.initialize(c, PW)
+        settings_store.put(c, "plain", "unchanged")
+        c.commit()
+        assert v.rotate_data_key(c, password=PW) == {"app_setting.absent": 0}
+        assert settings_store.get(c, "plain") == "unchanged"
+
+
+def test_register_setting_rejects_keys_that_are_not_plain():
+    v = Vault("demo")
+    for bad in ("", "a'b", "a b", "a;b", "{x}"):
+        with pytest.raises(ValueError):
+            v.register_setting(bad)
+    assert not v.stores()
+
+
+def test_legacy_decrypt_fallback_reads_new_and_legacy_rows():
+    v = unlocked_vault()
+    stored = []
+    assert legacy_decrypt_fallback(v, v.encrypt("new", "ctx"), "ctx", reencrypt=stored.append) == "new"
+    assert stored == []                                          # already bound to its context: nothing to store back
+    old = v.encrypt("old")                                       # a v2 row written with no context
+    assert legacy_decrypt_fallback(v, old, "ctx") == "old"        # read-only use
+    assert legacy_decrypt_fallback(v, old, "ctx", reencrypt=stored.append) == "old"
+    assert len(stored) == 1 and v.decrypt(stored[0], "ctx") == "old"
+    with pytest.raises(VaultError):
+        v.decrypt(stored[0], "")                                  # the stored value is bound now
+    fernet = legacy(v, "fernet")
+    assert legacy_decrypt_fallback(v, fernet, "ctx", reencrypt=stored.append) == "fernet"
+    assert len(stored) == 2 and stored[1].startswith("v2$") and v.decrypt(stored[1], "ctx") == "fernet"
+
+
+def test_legacy_decrypt_fallback_failures():
+    v = unlocked_vault()
+    other = v.encrypt("x", "elsewhere")
+    with pytest.raises(VaultError):
+        legacy_decrypt_fallback(v, other, "ctx")                  # neither context opens it: still refused
+    with pytest.raises(VaultError):
+        legacy_decrypt_fallback(v, "garbage", "")
+    locked = Vault("demo")
+    with pytest.raises(VaultLocked):
+        legacy_decrypt_fallback(locked, v.encrypt("x"), "ctx", reencrypt=lambda t: None)

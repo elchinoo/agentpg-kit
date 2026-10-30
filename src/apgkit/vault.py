@@ -431,6 +431,18 @@ class Vault:
         Leave it None when the app encrypts with an empty context."""
         self._stores[name] = (select_sql, update_sql, context)
 
+    def register_setting(self, key: str) -> str:
+        """Register one `app_setting` key whose value is a vault ciphertext (the common case for settings the app keeps in the
+        kit's settings table). Sets the select and update SQL and the context `app_setting.<key>`, and returns that context: pass
+        it to `encrypt` / `decrypt` when the app reads and writes the setting. The store is named `app_setting.<key>`.
+        A key that is not stored yet is simply skipped by a rotation. `key` may use letters, digits and `_ . : -` only."""
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", key or ""):
+            raise ValueError("setting key may only contain letters, digits and _ . : -")
+        context = f"app_setting.{key}"
+        self.register_store(context, f"SELECT key, value FROM app_setting WHERE key = '{key}'",
+                            "UPDATE app_setting SET value = %(value)s WHERE key = %(key)s", context=context)
+        return context
+
     def stores(self) -> dict[str, dict[str, str]]:
         """The registered stores: name -> {"select": ..., "update": ...} (what the vault encrypts, for audits and tests)."""
         return {n: {"select": s, "update": u, "context": c or ""} for n, (s, u, c) in self._stores.items()}
@@ -514,3 +526,32 @@ class Vault:
                 self._data_key = new_key
             self._mark_env(env)
             return counts
+
+
+def legacy_decrypt_fallback(vault: Vault, token: str, context: str, *, reencrypt: Callable[[str], object] | None = None) -> str:
+    """Decrypt `token` bound to `context`; for a row written before contexts existed, fall back to the empty context. Meant for
+    the migration window of an app that has just started passing contexts.
+
+    Order: `context` first, then the empty context (and legacy Fernet tokens, which never carried one). When the value was only
+    readable the old way, `reencrypt(new_token)` is called with the same plaintext sealed under `context` (store it back; skip the
+    argument to only read). A locked vault raises `VaultLocked` at once; when neither attempt works the FIRST error is raised
+    (the one for the real context). Once every row has been re-encrypted, replace the call by a plain `vault.decrypt(token, context)`."""
+    try:
+        plaintext = vault.decrypt(token, context)
+    except VaultLocked:
+        raise
+    except VaultError as first:
+        if not context:
+            raise
+        try:
+            plaintext = vault.decrypt(token, "")
+        except VaultLocked:
+            raise
+        except VaultError:
+            raise first from None
+    else:
+        if reencrypt is None or not is_legacy_token(token):
+            return plaintext                          # opened under its own context (or a legacy token with nothing to store back)
+    if reencrypt is not None:
+        reencrypt(vault.encrypt(plaintext, context))
+    return plaintext
