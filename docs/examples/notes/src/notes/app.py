@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import __version__
-from .core import COOKIE, CSRF_HEADER, auth, db, fed, local, metrics, vault
+from .core import BIND_HOST, BODY_CONTEXT, COOKIE, CSRF_HEADER, auth, db, fed, local, metrics, vault
 
 HERE = Path(__file__).resolve().parent
 
@@ -116,11 +116,8 @@ def setup(body: Setup, request: Request, response: Response):
 
 @app.post("/api/login")
 def login(body: Login, request: Request, response: Response):
-    if auth.limiter.limited(auth.client(request)):
-        raise HTTPException(429, "too many failed attempts; wait a minute")
-    with db.connect(retries=1) as conn:
-        if not local.login_password(conn, body.password):
-            auth.limiter.record(auth.client(request))
+    with db.connect(retries=1) as conn:                # counts the attempt before hashing: 429 over the limit, 503 when busy
+        if not local.login_password(conn, body.password, client=auth.client(request), limiter=auth.limiter):
             raise HTTPException(401, "invalid credentials")
         start_session(conn, request, response)
     return {"ok": True}
@@ -150,7 +147,7 @@ def list_notes(who=Depends(auth.require("notes:read"))):
     for r in rows:
         if r["private"]:
             try:
-                r["body"] = vault.decrypt(r["body"])
+                r["body"] = vault.decrypt(r["body"], BODY_CONTEXT)
             except VaultError:                         # VaultLocked is one: the UI shows "locked" and the unlock banner
                 r["body"] = None
     return rows
@@ -159,7 +156,7 @@ def list_notes(who=Depends(auth.require("notes:read"))):
 @app.post("/api/notes")
 def add_note(body: NoteIn, who=Depends(auth.require("notes:write"))):
     try:
-        text = vault.encrypt(body.body) if body.private else body.body
+        text = vault.encrypt(body.body, BODY_CONTEXT) if body.private else body.body
     except VaultLocked as exc:
         raise HTTPException(423, str(exc)) from exc
     with db.connect() as conn:
@@ -199,5 +196,5 @@ def serve() -> None:
     import os
 
     import uvicorn
-    uvicorn.run("notes.app:app", host=os.environ.get("HOST", "127.0.0.1"), port=int(os.environ.get("PORT", "8000")),
-                proxy_headers=True, forwarded_allow_ips="*")
+    uvicorn.run("notes.app:app", host=BIND_HOST, port=int(os.environ.get("PORT", "8000")), proxy_headers=True,
+                forwarded_allow_ips=os.environ.get("NOTES_FORWARDED_ALLOW_IPS", "127.0.0.1"))   # only the reverse proxy's address, never "*"

@@ -1,4 +1,6 @@
 """This app's instances of the kit blocks and its authorization model."""
+import os
+
 from apgkit import metrics as metrics_mod
 from apgkit.auth import AppAuth, Authenticator, LocalAuth, from_env
 from apgkit.config import env_bool
@@ -8,6 +10,8 @@ from apgkit.vault import Vault
 from . import __version__
 
 APP, COOKIE, CSRF_HEADER, TOKEN_PREFIX = "notes", "nt_session", "x-notes-csrf", "nt_"
+BIND_HOST = os.environ.get("HOST", "127.0.0.1")        # where uvicorn listens; the Authenticator refuses anonymous mode on a public one
+BODY_CONTEXT = "note.body"                             # binds each private body to its column (vault contexts, GUIDE 7.3.0)
 
 ALL = frozenset({"*"})
 ROLE_PERMISSIONS = {                                   # roles people get from the identity provider ("notes:editor")
@@ -29,7 +33,7 @@ app_auth = AppAuth(APP, fed.client_id, ROLE_PERMISSIONS, SCOPE_PERMISSIONS)
 local = LocalAuth(app_auth, env_prefix="NOTES", token_prefix=TOKEN_PREFIX, token_scopes={"read", "full"}, vault=vault,
                   on_reset=lambda conn: conn.execute("DELETE FROM note WHERE private"))   # a reset vault cannot read private notes
 auth = Authenticator(app_auth, local, db, cookie_name=COOKIE, verifier=fed.verifier,
-                     allow_anonymous=lambda: env_bool("NOTES_ALLOW_ANONYMOUS"))
+                     allow_anonymous=lambda: env_bool("NOTES_ALLOW_ANONYMOUS"), bind_host=BIND_HOST)
 
 
 def _probe() -> dict[str, float]:

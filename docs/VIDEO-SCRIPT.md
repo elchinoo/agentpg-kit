@@ -140,11 +140,11 @@ the second terminal tab and run:
 psql -h 127.0.0.1 -p 55432 -U postgres notes_test -c "select title, left(body, 40) as body, private from note order by id"
 ```
 
-The output shows `First | hello | f` and `Secret | gAAAAAB... | t`.
+The output shows `First | hello | f` and `Secret | v2$... | t`.
 
 **NARRATION:** "Let's add two notes. A normal one first. Now a private one. We tick the private box. In the browser, both look the same, except for a badge. Now let's look at what the database holds. The normal note is plain text. The private note is scrambled. The vault encrypted it before it was saved. And the key is not in the database. So someone with a copy of the database, but without the admin password, could not read it."
 
-**CALLOUTS:** highlight the `gAAAAA` value, caption "encrypted by the vault".
+**CALLOUTS:** highlight the `v2$` value, caption "encrypted by the vault".
 
 ### Scene 8 (4:24 to 4:46): Shared UI: confirmation dialog
 

@@ -326,10 +326,10 @@ test('record docs/VIDEO-SCRIPT.md', async ({ browser }) => {
     // ---- Scene 4: the app's core
     await scene(4);
     const EX = 'docs/examples/notes/src/notes';
-    await term.file(`${EX}/core.py`, 11, 34, [[/^ROLE_PERMISSIONS/, 'role -> permission'], [/^vault = Vault/, 'the vault: encrypted storage'], [/^fed = from_env/, 'single sign-on if configured'], [/^local = LocalAuth/, 'local login'], [/^auth = Authenticator/, 'one front door']],
+    await term.file(`${EX}/core.py`, 15, 38, [[/^ROLE_PERMISSIONS/, 'role -> permission'], [/^vault = Vault/, 'the vault: encrypted storage'], [/^fed = from_env/, 'single sign-on if configured'], [/^local = LocalAuth/, 'local login'], [/^auth = Authenticator/, 'one front door']],
       [/First, roles/, /vault line/, /single sign-on/, /local login/, /authenticator/]);
     await term.file(`${EX}/migrations/001_notes.sql`, 1, 10, [[/CREATE TABLE/, 'migrations run once']], [/Now the database/]);
-    await term.file(`${EX}/app.py`, 140, 180, [[/@app\.delete/, 'one question: can()']], [/Last, a route/]);
+    await term.file(`${EX}/app.py`, 137, 177, [[/@app\.delete/, 'one question: can()']], [/Last, a route/]);
 
     // ---- Scene 5: start the server
     await scene(5);
@@ -384,10 +384,10 @@ test('record docs/VIDEO-SCRIPT.md', async ({ browser }) => {
     await term.type(`psql -h 127.0.0.1 -p 55432 -U postgres notes_test -c "${q}"`);   // as in the script; really run against the rehearsal database
     const real = execFileSync('psql', [...psqlArgs(DB), '-c', q], { encoding: 'utf8' });
     await term.out(real);
-    expect(real).toMatch(/Secret\s*\|\s*gAAAAA/);
+    expect(real).toMatch(/Secret\s*\|\s*v2\$/);
     expect(real).toMatch(/First\s*\|\s*hello\s*\|\s*f/);
     await sync(page, /is scrambled/);
-    await term.highlight('gAAAAA', 'encrypted by the vault', 3000);
+    await term.highlight('v2$', 'encrypted by the vault', 3000);
 
     // ---- Scene 8: confirmation dialog
     await scene(8);
