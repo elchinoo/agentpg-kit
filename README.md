@@ -131,6 +131,9 @@ pytest -q
 ## Changelog
 
 ### 0.4.0
+- Hardening (vault v2): new ciphertexts are `v2$<key id>$...` AES-256-GCM tokens under an HKDF-SHA256 subkey of the data key, bound to a caller-supplied `context` (`encrypt(plaintext, context="")`, `decrypt(token, context="")`; contexts are optional, calls without one bind nothing). Legacy Fernet tokens still decrypt; `rotate_data_key` upgrades them and `Vault.reencrypt_legacy` upgrades single values. `register_store(..., context=template)`, `Vault.derive_key(purpose)`, `Vault.has_password_wrap`. Key wraps are AES-256-GCM bound to their slot. See GUIDE 7.3.0.
+- Hardening: the platform-secret wrap uses HKDF-SHA256 when the secret is long and random (at least 32 decoded bytes or 43 url-safe characters), scrypt otherwise; the KDF name is stored in `vault_kdf_env` and old wraps are read and upgraded. Unlocking with a generated key no longer costs 128 MiB.
+- Hardening: scrypt is bounded. All derivations share a process-wide cap (`APGKIT_SCRYPT_CONCURRENCY`, default 2; saturated callers get `passwords.ScryptBusy`, HTTP 503). `LocalAuth.login_password(..., client=, limiter=)` counts the attempt before hashing and answers 429 over the limit, and a login performs one scrypt derivation (the vault wrap doubles as the password check).
 - New: `Vault.rotate_data_key(conn, reencrypt=None, password=...)` (new data key, re-encryption of every stored secret and both wraps in one transaction), `Vault.rotate_platform_secret`, `Vault.drop_platform_wrap`, and a store registry (`register_store`, `stores`). See GUIDE 7.3.1.
 - Hardening: scrypt N=2^17 for new vault wraps and new password hashes; parameters are stored per wrap and legacy wraps and hashes still verify and are upgraded on next use. Constant-time comparison of the OIDC nonce and the vault key check. Documented admin-password-only mode (GUIDE 7.3.2); defaults unchanged.
 

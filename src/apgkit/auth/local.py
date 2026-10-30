@@ -9,7 +9,10 @@ Federated mode (see oidc.py / rp.py) sits beside this; an app can run either or 
 """
 import hmac
 import secrets
+import threading
 from datetime import UTC, datetime, timedelta
+
+from fastapi import HTTPException
 
 from .. import passwords
 from .. import settings_store as store
@@ -29,6 +32,8 @@ class LocalAuth:
         self.app, self.env_prefix, self.token_prefix = app, env_prefix.upper(), token_prefix
         self.token_scopes, self.vault, self.on_reset = token_scopes, vault, on_reset
         self._setup_code: str | None = None
+        self.limiter = None                       # optional FailureLimiter: login_password counts attempts before it hashes
+        self._reserve = threading.Lock()
 
     # ---- setup and password -------------------------------------------------------------------------------
     def setup_code(self) -> str:
@@ -72,23 +77,69 @@ class LocalAuth:
                 self.vault.initialize(conn, password)
         conn.commit()
 
-    def login_password(self, conn, password: str) -> bool:
+    def _reserve_attempt(self, limiter, client: str | None) -> bool:
+        """Check the limiter and record this attempt as one atomic step, BEFORE any hashing: a burst of concurrent requests is
+        counted one by one, and everything past the limit is refused (429) without costing a single scrypt derivation."""
+        if limiter is None or client is None:
+            return False
+        with self._reserve:
+            if limiter.limited(client):
+                raise HTTPException(429, "too many failed attempts; wait a minute")
+            limiter.record(client)
+        return True
+
+    @staticmethod
+    def _release_attempt(limiter, client: str | None) -> None:
+        """Give the reserved slot back (the attempt succeeded, or never reached the hash)."""
+        forgive = getattr(limiter, "forgive", None)
+        if forgive is not None:
+            forgive(client)
+            return
+        try:                                       # a limiter without `forgive`: drop this client's newest entry
+            with limiter._lock:
+                if limiter._failures.get(client):
+                    limiter._failures[client].pop()
+        except AttributeError:
+            pass
+
+    def _check_password(self, conn, password: str, stored: str) -> bool:
+        """Verify the admin password with ONE scrypt derivation. When the app has a vault with a password wrap, the wrap IS the
+        check: it opens only under the right password (authenticated encryption), and opening it also unlocks the vault. Without
+        one, the stored hash is verified. (They used to run one after the other: hash, vault wrap and platform wrap, up to three
+        128 MiB derivations per attempt.)"""
+        if self.vault is not None and self.vault.has_password_wrap(conn):
+            return self.vault.unlock_with_password(conn, password)
+        return passwords.verify_password(password, stored)
+
+    def login_password(self, conn, password: str, *, client: str | None = None, limiter=None) -> bool:
+        """True when `password` is the admin password (and unlocks the vault). Pass `client` (the caller's address) and the app's
+        `limiter` (or set `self.limiter`) to have the attempt counted before hashing: raises HTTPException 429 when the client is
+        over the limit and `passwords.ScryptBusy` (HTTP 503) when every scrypt slot is taken. A failure stays counted; a success
+        is forgiven. Steady state: exactly one scrypt derivation per call."""
+        limiter = limiter if limiter is not None else self.limiter
         stored = store.get(conn, _K_ADMIN)
-        if stored is None or not passwords.verify_password(password, stored):
+        if stored is None:
+            return False
+        reserved = self._reserve_attempt(limiter, client)
+        try:
+            ok = self._check_password(conn, password, stored)
+        except BaseException:                             # scrypt busy, database error: no password was judged, give the slot back
+            if reserved:
+                self._release_attempt(limiter, client)
+            raise
+        if reserved and ok:
+            self._release_attempt(limiter, client)
+        if not ok:
             return False
         if passwords.needs_rehash(stored):                # hashed with weaker parameters: upgrade it now that the password is in hand
             store.put(conn, _K_ADMIN, passwords.hash_password(password))
-        if self.vault:
-            self.vault.unlock_with_password(conn, password)
         conn.commit()
         return True
 
     def change_password(self, conn, current: str, new: str) -> None:
         stored = store.get(conn, _K_ADMIN)
-        if stored is None or not passwords.verify_password(current, stored):
+        if stored is None or not self._check_password(conn, current, stored):
             raise PermissionError("current password is incorrect")
-        if self.vault and not self.vault.is_unlocked():
-            self.vault.unlock_with_password(conn, current)
         self.set_admin_password(conn, new)
 
     def reset_admin(self, conn) -> None:

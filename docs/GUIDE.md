@@ -148,7 +148,7 @@ Module map (every file in `src/apgkit`):
 | `migrate.py` | `run(db, dir, extensions=, replacements=, table=)`; `SHARED_SQL` creates `app_setting` |
 | `settings_store.py` | `get`, `put`, `delete` on `app_setting(key, value)` |
 | `passwords.py` | scrypt hashing (`hash_password`, `verify_password`, `check_strength`, `MIN_LENGTH=12`) |
-| `vault.py` | `Vault`: envelope encryption (Fernet) with the data key wrapped under the admin password and/or a platform secret |
+| `vault.py` | `Vault`: envelope encryption (AES-256-GCM, versioned `v2$` tokens; legacy Fernet still readable) with the data key wrapped under the admin password and/or a platform secret |
 | `ratelimit.py` | `FailureLimiter` (in memory, per process) |
 | `netguard.py` | `NetGuard.check(url)`; `UnsafeURL` |
 | `llm.py` | `LLMClient`, `ChatConfig`, `LLMError` family, `answer_text`, `empty_answer_error`, `redact` |
@@ -433,11 +433,54 @@ pool = db.pool()                                # hot paths: ConnectionPool; use
   malformed or unknown-scheme string; `check_strength` raises `ValueError`.
 - `Vault(prefix)`: `initialize(conn, password)`, `initialize_with_platform_secret(conn)` (for SSO-only apps with no admin password;
   False if there is no platform secret or the vault exists), `unlock_with_password`, `try_unlock_with_platform_secret`, `lock`,
-  `change_password`, `reset`, `status(conn)` (`initialized`, `unlocked`, `auto_unlock`, `reason`), `encrypt`, `decrypt`. A locked vault raises
+  `change_password`, `reset`, `status(conn)` (`initialized`, `unlocked`, `auto_unlock`, `reason`), `encrypt(plaintext, context='')`, `decrypt(token, context='')`. A locked vault raises
   `VaultLocked`; an undecryptable token raises `VaultError` ("Re-enter it"). Both messages are safe to show users.
 - `LocalAuth(vault=...)` wires the vault to the admin password: `set_admin_password` initialises or re-wraps it, `login_password`
   unlocks it, `change_password` re-wraps it, `reset_admin` resets it and calls your `on_reset(conn)` hook to delete whatever was
   encrypted (it would be unreadable).
+
+#### 7.3.0 Ciphertext format, contexts and KDFs (since 0.4.0)
+
+- **Token format.** `encrypt` returns `v2$<key id>$<base64url(nonce + ciphertext + tag)>`: AES-256-GCM with a random 96-bit nonce.
+  The key id is a 12-hex-character fingerprint of the data key (derived with HKDF, not secret); it lets a token written under
+  another key fail with a clear message and gives rotation something to key on. Tokens written by earlier kit versions
+  (Fernet: AES-128-CBC + HMAC, starting `gAAAA`) are detected by format and still decrypt; they are replaced by v2 tokens when
+  `rotate_data_key` runs, or one by one with `reencrypt_legacy`.
+- **One key, one purpose.** The data key is never used directly: the AES key is `HKDF-SHA256(data key, info="apgkit/vault/secret")`,
+  the key id uses `info="apgkit/vault/kid"`, and the key wraps use `info="apgkit/vault/wrap"` derived from the wrapping key. For
+  your own non-encryption needs (an HMAC key, say) call `vault.derive_key("<purpose>")`, which uses a separate label per purpose.
+- **Context (associated data).** `encrypt(plaintext, context)` and `decrypt(token, context)` take a stable string that says where
+  the value lives, for example `f"provider.api_key_enc:{provider_id}"`. It is authenticated with the ciphertext, so a ciphertext
+  copied to another row or column (by anyone with database write access) fails to decrypt with `VaultError`. Use a context at
+  every call site, built only from values that never change for that row (table, column, primary key). Calls without a context
+  keep working (empty context) but bind nothing: they are the weaker form and exist for compatibility. Legacy Fernet tokens never
+  carried a context, so the argument is ignored for them. When you move an existing column to contexts, read each value (any
+  format), then write `vault.reencrypt_legacy(token, context)` (a no-op for tokens that are already v2) in your migration, or
+  let the next `rotate_data_key` do it.
+- **Rotation and contexts.** `register_store(name, select_sql, update_sql, context="provider.api_key_enc:{id}")` takes the context
+  as a `str.format` template over the selected columns, so rotation re-encrypts each value bound to its own row. In a
+  `rotate_data_key` callback, `old_decrypt(token, context="")` and `new_encrypt(plaintext, context="")` accept the context, and
+  `vault.reencrypt_legacy(token, context, old_decrypt=old_decrypt, new_encrypt=new_encrypt)` does both steps for one value.
+- **Wraps.** The data key is wrapped with AES-256-GCM (`v2$wrap$...`) whose associated data names the storage slot, so the
+  password wrap cannot be moved into the platform slot. Old Fernet wraps open as before and are rewritten when their secret is
+  next presented (password sign-in, platform-secret unlock at start).
+- **Platform-secret KDF.** The wrap under `<PREFIX>_ENCRYPTION_KEY` uses HKDF-SHA256 when `apgkit.vault.is_high_entropy(secret)`:
+  at least 32 bytes after base64 or hex decoding, or at least 43 url-safe characters (`[A-Za-z0-9_-]`, 256 bits), and at least
+  16 distinct characters (so a long repeated phrase is not mistaken for a random key). Keys made by our tooling qualify; unlocking
+  then costs microseconds and no memory. Anything else (a secret a human typed) keeps scrypt (N=2^17: 128 MiB per derivation).
+  The name is stored with the wrap (`vault_kdf_env` = `hkdf$sha256` or `scrypt$17$8$1`), so a wrap is always opened with the KDF
+  it was written with; old wraps keep being read and are upgraded in place. The admin-password wrap always uses scrypt.
+- **Bounded scrypt.** Every scrypt derivation (password hashes and vault wraps) runs under a process-wide cap,
+  `APGKIT_SCRYPT_CONCURRENCY` (default 2; `passwords.set_concurrency(n)` sets it at start-up). A caller that finds every slot
+  busy for half a second gets `passwords.ScryptBusy`, an `HTTPException` with status 503 and `Retry-After: 1`, so a route that
+  does not catch it still answers 503 instead of queueing. Plan memory as `cap x 128 MiB`.
+- **Login.** `LocalAuth.login_password(conn, password, client=..., limiter=...)` (or set `local.limiter`) counts the attempt in
+  the limiter BEFORE hashing, atomically with the limit check, so a concurrent burst is counted one by one and everything over
+  the limit gets 429 without a derivation; a success is forgiven, an attempt that never reached a verdict (scrypt busy) is
+  returned. Without those arguments the old check-then-record pattern in the app's own handler applies. A login costs exactly one
+  scrypt derivation in steady state: when the vault has a password wrap, opening that wrap is the password check (authenticated
+  encryption) and unlocks the vault in the same step; otherwise the stored hash is verified. Old wraps and hashes add one
+  upgrade derivation the first time they are seen.
 
 #### 7.3.1 Rotating the data key, and the other vault operations (since 0.4.0)
 
