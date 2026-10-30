@@ -98,10 +98,10 @@ class LLMClient:
         self._http = http_factory or (lambda: httpx.Client(timeout=60, follow_redirects=False))
 
     @staticmethod
-    def _bounded_post(client: httpx.Client, url: str, headers: dict, body: dict) -> httpx.Response:
+    def _bounded_post(client: httpx.Client, url: str, headers: dict, body: dict, extensions: dict | None = None) -> httpx.Response:
         """POST and read the answer in chunks, refusing it as soon as it passes MAX_RESPONSE_BYTES (a hostile provider cannot make us
         buffer an unbounded body)."""
-        with client.stream("POST", url, headers=headers, json=body) as r:
+        with client.stream("POST", url, headers=headers, json=body, extensions=extensions or {}) as r:
             if r.is_redirect:
                 return r
             data = bytearray()
@@ -113,17 +113,21 @@ class LLMClient:
             return httpx.Response(r.status_code, headers=kept, content=bytes(data), request=r.request)
 
     def post_json(self, base_url: str, path: str, api_key: str, body: dict, *, trusted: bool, retries: int = 3) -> httpx.Response:
+        pin_headers: dict[str, str] = {}
+        extensions: dict = {}
+        url = f"{base_url.rstrip('/')}{path}"
         if not trusted:
             try:
-                base_url = self.guard.check(base_url)
+                target = self.guard.resolve(base_url)       # resolved once; the request below goes to this exact address
             except UnsafeURL as exc:
                 raise LLMError(f"provider URL rejected: {exc}") from exc
-        url = f"{base_url.rstrip('/')}{path}"
+            url, pin_headers, extensions = target.request_args(path)
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        headers.update(pin_headers)
         with self._http() as client:
             for attempt in range(retries + 1):
                 try:
-                    resp = self._bounded_post(client, url, headers, body)
+                    resp = self._bounded_post(client, url, headers, body, extensions)
                 except httpx.TimeoutException as exc:
                     if attempt == retries:
                         raise LLMTimeout("the provider did not answer in time") from exc

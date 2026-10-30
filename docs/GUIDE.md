@@ -95,9 +95,9 @@ The import lists come from a search of each project's `src/` for `from apgkit...
 
 Credentials flow, end to end, for the common cases:
 
-1. **Person in a browser.** App page -> `GET /auth/login` (app route that calls `RelyingParty.begin`) -> identity (authorization code
-   + PKCE, scopes `openid profile email roles`) -> `GET /auth/callback` (app route calling `RelyingParty.finish`, which verifies the
-   ID token and nonce) -> the app starts a server-side session with the roles from the verified ID token. Roles named
+1. **Person in a browser.** App page -> `GET /auth/login` (app route that calls `RelyingParty.start` and sets the browser-binding cookie) -> identity (authorization code
+   + PKCE, scopes `openid profile email roles`) -> `GET /auth/callback` (app route calling `RelyingParty.finish` with the binding cookie, which verifies the
+   cookie, the ID token and the nonce) -> the app starts a server-side session with the roles from the verified ID token. Roles named
    `<app>:<role>` map to permissions; roles of other apps are ignored.
 2. **Service to service.** Caller builds `TokenSource(issuer, client_id, secret_getter, scope="callee.scope")`, which fetches a
    `client_credentials` token (cached until 30 s before expiry) and sends `Authorization: Bearer`. The callee's `Authenticator`
@@ -149,7 +149,7 @@ Module map (every file in `src/apgkit`):
 | `settings_store.py` | `get`, `put`, `delete` on `app_setting(key, value)` |
 | `passwords.py` | scrypt hashing (`hash_password`, `verify_password`, `check_strength`, `MIN_LENGTH=12`) |
 | `vault.py` | `Vault`: envelope encryption (AES-256-GCM, versioned `v2$` tokens; legacy Fernet still readable) with the data key wrapped under the admin password and/or a platform secret |
-| `ratelimit.py` | `FailureLimiter` (in memory, per process) |
+| `ratelimit.py` | `FailureLimiter` (in memory, per process, LRU/TTL eviction) |
 | `netguard.py` | `NetGuard.check(url)`; `UnsafeURL` |
 | `llm.py` | `LLMClient`, `ChatConfig`, `LLMError` family, `answer_text`, `empty_answer_error`, `redact` |
 | `guard.py` | `SecurityGuard` pure-ASGI middleware |
@@ -159,7 +159,7 @@ Module map (every file in `src/apgkit`):
 | `auth/principal.py` | `AppAuth`, `Principal`, `WILDCARD` |
 | `auth/local.py` | `LocalAuth` |
 | `auth/oidc.py` | `TokenVerifier`, `TokenSource`, `discover`, `principal_from_claims`, `TokenError` |
-| `auth/rp.py` | `RelyingParty`, `safe_return_to` |
+| `auth/rp.py` | `RelyingParty`, `LoginStart`, `clear_binding`, `safe_return_to` |
 | `auth/authenticator.py` | `Authenticator` |
 | `auth/env.py` | `from_env(prefix, default_client_id)` -> `Federation` |
 | `auth/schema.py` | `SQL`: idempotent DDL for `web_session`, `api_token`, `oidc_login` (and `app_setting`) |
@@ -271,7 +271,7 @@ stderr and gives an empty string.
 | Variable | Default file | Read by | Meaning |
 |---|---|---|---|
 | `<PREFIX>_ENCRYPTION_KEY` (+ `_FILE`) | `/etc/<prefix>/encryption_key` (prefix lower-cased) | `Vault` | The platform secret that wraps the vault data key so the vault unlocks at start without the admin password. Empty: the vault needs the admin password after every restart. |
-| `<PREFIX>_API_KEY` (+ `_FILE`) | `/etc/<prefix>/api_key` | `LocalAuth.static_key` | A full-access static credential for automation. Presence also disables the first-run setup flow (`needs_setup` is false) and makes `static_key_configured()` true. |
+| `<PREFIX>_API_KEY` (+ `_FILE`) | `/etc/<prefix>/api_key` | `LocalAuth.static_key` | A full-access static credential for automation. At least 32 characters or it is never accepted (an error is logged); a warning is logged at startup whenever one is enabled. Prefer scoped API tokens. Presence also disables the first-run setup flow (`needs_setup` is false) and makes `static_key_configured()` true. |
 | `<PREFIX>_OIDC_CLIENT_SECRET` (+ `_FILE`) | none | `from_env` | The app's confidential-client secret at the identity provider. Empty at start means a **public client** (PKCE only, `client_id` sent in the token request). |
 
 ### 5.3 Federation (`apgkit.auth.from_env(prefix, default_client_id)`)
@@ -290,7 +290,8 @@ stderr and gives an empty string.
 |---|---|---|
 | `NetGuard("X_ALLOW_PRIVATE_URLS")` | `TRUSTDESK_ALLOW_PRIVATE_LLM_URLS`, `PAYBROKER_ALLOW_PRIVATE_URLS`, `LLMGW_ALLOW_PRIVATE_URLS` ... | If true, loopback/private targets are allowed (for a local model server). Link-local (cloud metadata) is **always** refused. |
 | `public_url(request, "X_PUBLIC_URL")` | `TRUSTDESK_PUBLIC_URL`, `SHOPFRONT_PUBLIC_URL`, `IDENTITY_PUBLIC_URL` | The externally visible base URL; when unset the request's scheme and `Host` header are used (and `X-Forwarded-Proto: https` is honoured). Used to build the OIDC `redirect_uri` (`<url>/auth/callback`). |
-| `Authenticator(allow_anonymous=...)` | `CITYPULSE_ALLOW_ANONYMOUS` | If it returns true every request is `Principal("anonymous")` with `*`. Off unless the app wires it. |
+| `Authenticator(allow_anonymous=...)` | `CITYPULSE_ALLOW_ANONYMOUS` | If it returns true every request is `Principal("anonymous")` with `*`. Off unless the app wires it. **Refused unless the bind address is loopback** (`Authenticator(bind_host=...)`, default `<PREFIX>_HOST`, else `HOST`; unknown counts as public) **or `<PREFIX>_ALLOW_ANONYMOUS_PUBLIC=1`** is set (then a warning is logged). `config.anonymous_allowed(prefix)` applies the same rule for apps that read the flag themselves. |
+| `<PREFIX>_TRUSTED_HOPS` | 1 | Proxies in front of the app for `client_ip` (0 = socket peer). See 7.12. |
 | `LocalAuth(env_prefix=, token_prefix=, token_scopes=)` | `CITYPULSE`, `cp_`, `{read, ingest, metrics, full}` | Prefix of env names, prefix of generated API tokens (also how `Authenticator` recognises them), and the scopes a token may have. |
 
 ### 5.5 LLM variables (set by ecoctl for apps with `llm: true`; read by the app, passed to the kit)
@@ -390,7 +391,7 @@ Observed during verification: a short password returns 422 `password must be at 
 
 The example already builds `fed = from_env("NOTES", "notes")` and passes `fed.verifier` to `Authenticator`, so **service tokens from
 identity work as soon as `NOTES_OIDC_ISSUER` is set** (client id `notes` = audience). Browser SSO additionally needs two routes, `/auth/login`
-and `/auth/callback`, that call `fed.rp.begin(...)` and `fed.rp.finish(...)` and then `local.create_session(conn, subject=..., roles=...,
+and `/auth/callback`, that call `fed.rp.start(...)` (with `.bind(response)` on the redirect) and `fed.rp.finish(..., binding)` and then `local.create_session(conn, subject=..., roles=...,
 source="oidc", id_token_hint=...)`. Copy them from `CityPulse/src/citypulse/api.py` (`sso_login`, `sso_callback`); the example omits
 them to stay short, and its `/api/session` reports `"sso": null`. The kit side of that flow is covered by `tests/test_oidc.py`.
 
@@ -569,9 +570,16 @@ successful local-token lookups; `forget_tokens()` clears this process.
 triggers one rate-limited JWKS refresh. `principal_from_claims` keeps only roles of this app and the space-separated `scope` claim,
 and sets `kind` to `service` when `sub_type == "service"`.
 
-`RelyingParty(issuer, client_id, secret_getter)`: `begin(conn, redirect_uri, return_to, provider_hint=)` stores state, PKCE verifier
-and nonce in `oidc_login` and returns the authorize URL; `finish(conn, redirect_uri, code, state)` consumes the state once, exchanges
-the code, verifies the ID token and nonce and returns `(claims, return_to, id_token)`; `logout_url(id_token_hint, post_logout_redirect)`
+`RelyingParty(issuer, client_id, secret_getter)`: `start(conn, redirect_uri, return_to, provider_hint=)` stores state, PKCE verifier,
+nonce and a binding hash in `oidc_login` and returns a `LoginStart(url, binding)`; the app redirects to `url` and calls
+`start.bind(response)` on that redirect, which sets the short-lived binding cookie `apg_oidc_bind` (HttpOnly, Secure, SameSite=Lax,
+10 minutes; `secure=False` only for plain-http local development). `finish(conn, redirect_uri, code, state, binding)` consumes the
+state once, requires `binding` (the cookie value, `request.cookies.get(BINDING_COOKIE)`) to equal the hash of this state and nonce
+(constant-time; a callback in a browser that did not start the login, or without the cookie, raises `TokenError` and the state is
+burnt), exchanges the code, verifies the ID token and nonce and returns `(claims, return_to, id_token)`; call
+`clear_binding(response)` on the callback's response. This closes login CSRF (an attacker cannot make a victim's browser finish the
+attacker's login). **Breaking since 0.4.0:** `begin` is gone (it could not bind the browser) and `finish` takes the extra `binding`
+argument; the `oidc_login.binding_hash` column is added by `auth.schema.SQL`; `logout_url(id_token_hint, post_logout_redirect)`
 builds the end-session URL if the provider advertises one. `safe_return_to` accepts only same-site paths.
 
 ### 7.5 `SecurityGuard`
@@ -599,7 +607,19 @@ header, appear under `route="other"`). `/metrics` itself is not counted.
 
 `NetGuard(env_name).check(url)` returns the URL without a trailing slash or raises `UnsafeURL` for: empty or over 300 characters,
 non-http(s), embedded credentials, query or fragment, unresolvable host, link-local addresses (always), private/loopback addresses
-unless the env flag is true, plain http to anything that is not a local server.
+unless the env flag is true, plain http to anything that is not a local server. Blocked ranges: 0/8, 10/8, 100.64/10 (CGNAT),
+127/8, 169.254/16 (link-local, never allowed), 172.16/12, 192.0.0/24, 192.0.2/24, 192.168/16, 198.18/15 (benchmark), 198.51.100/24,
+203.0.113/24, multicast, 240/4; IPv6 `::/96` (IPv4-compatible), `::1`, `100::/64`, `2001:db8::/32`, `fc00::/7`, `fe80::/10`,
+`fec0::/10` (site-local), `ff00::/8`, `64:ff9b:1::/48`; and the forms that embed an IPv4 address (IPv4-mapped, NAT64
+`64:ff9b::/96`, 6to4 `2002::/16`, Teredo `2001::/32` server and client) are refused whenever the embedded address is not public
+(Python 3.13 classifies several of these as global). Every address a name resolves to must pass.
+
+**Pinning.** `NetGuard.resolve(url)` resolves the host once and returns a `Resolved` holding the validated IP; `check(url)` is
+`resolve(url).url`. `Resolved.request_args(path)` returns `(url, headers, extensions)` for httpx: the request goes to the literal IP
+with the original `Host` header and `extensions={"sni_hostname": host}` so TLS SNI and certificate verification still use the
+name, and there is no second DNS lookup for a rebinding server to answer. `LLMClient.post_json` does this for untrusted URLs. Apps
+that call `check()` and then hand the URL to their own HTTP client (webhooks) should switch to `resolve()` and `request_args()`.
+Redirects are never followed; `LLMClient` refuses a 3xx outright.
 
 `LLMClient(guard, vault=None)`: `chat(cfg, messages, max_tokens=700, temperature=0.1)` posts to `<base_url>/chat/completions`, reads
 the answer in bounded chunks, never follows redirects, retries transient errors, redacts the key from every error it raises, and
@@ -610,7 +630,10 @@ embeddings; the kit has no embeddings helper). Errors: `LLMError`, `LLMTimeout`,
 
 ### 7.8 `FailureLimiter`
 
-`limited(client)`, `record(client)`, `clear()`. Memory is bounded (`max_clients`, default 10 000; cleared when exceeded).
+`limited(client)`, `record(client)`, `clear()`. Memory is bounded (`max_clients`, default 10 000) by eviction, never by a reset: when
+the table is over the cap, clients whose failures all left the window go first, then the least recently failed client, one at a time.
+Looking up a client that never failed adds nothing. Only more than `max_clients` simultaneously active failing addresses can push a
+limited client out.
 
 ### 7.9 The shared UI (`/kit/...`)
 
@@ -780,6 +803,26 @@ Limitations and gotchas:
 - Hash masking is a short unsalted digest: it hides the value from casual reading, it does not stop a guess-and-compare of low-entropy values.
 - A view column with the `pass` rule or a raw expression is exactly as safe as the expression; review them.
 
+### 7.12 Client address and trusted proxies
+
+`web.client_ip(request, trusted_hops=1)` is the address used for rate limiting and logs: the `trusted_hops`-th entry of
+`X-Forwarded-For` counting from the **right** (each of your proxies appends the address it saw; anything left of that is supplied by
+the client and ignored). `trusted_hops` comes from `config.trusted_hops("<PREFIX>")` = `<PREFIX>_TRUSTED_HOPS`, default **1** (AgentPG
+puts a single proxy in front of a sandbox app); **0** ignores the header and uses the socket peer. With fewer entries than hops, or an
+unparsable entry, the socket peer is used. `Authenticator.client(request)` and `SecurityGuard` (which leaves the value in
+`request.state.client_ip`; parameter `trusted_hops`) use it, so the limiter no longer keys on a client-chosen header entry.
+
+The app must only be reachable through the proxy; a client that connects directly can set the last entry itself. Also run uvicorn with
+the forwarded headers restricted to the proxy, never `"*"`:
+
+```python
+uvicorn.run(app, host=host, port=port, proxy_headers=True, forwarded_allow_ips=os.environ.get("FORWARDED_ALLOW_IPS", "127.0.0.1"))
+```
+
+(`FORWARDED_ALLOW_IPS` is uvicorn's own variable: a comma-separated list of proxy addresses or CIDRs.) With `"*"` uvicorn rewrites
+`request.client` from a header any caller can set. If uvicorn rewrites `request.client` from a trusted proxy, `<PREFIX>_TRUSTED_HOPS=0`
+reads that already-resolved address instead of counting again.
+
 ## 8. Roles, scopes and permissions
 
 The kit has no fixed roles. Each app declares its own; the kit supplies the machinery.
@@ -819,14 +862,14 @@ that app's `core.py`.
   memory. A database dump alone cannot decrypt; **a dump plus the admin password, or plus the platform secret, can.**
 - **Token verification**: algorithm allow-list (`none` and HMAC refused, closing key confusion), mandatory issuer, audience, expiry,
   subject; JWKS from the discovered `jwks_uri`; the discovery document's `issuer` must equal the configured one.
-- **Login flow**: PKCE (S256), single-use state and nonce in the database, 10 minute expiry, `return_to` limited to same-site paths.
+- **Login flow**: PKCE (S256), single-use state and nonce in the database bound to the browser by a cookie, 10 minute expiry, `return_to` limited to same-site paths.
 - **Outbound calls**: `NetGuard` on every non-trusted call, redirects never followed, responses bounded, API key redacted from errors.
   The identity discovery, JWKS and token calls also never follow redirects.
 - **Browser**: strict CSP, `no-store`, frame denial, CSRF header on cookie-authenticated writes. Cookies are set by the **app**; the
   fleet apps use `HttpOnly`, `SameSite` (`strict` for local login, `lax` for SSO callback) and `Secure` when the request is https.
-- **Limits stated in SECURITY.md**: rate limiting is per process (and keyed by `request.client.host`, so behind a proxy run uvicorn with
-  `proxy_headers=True` and a correct `forwarded_allow_ips`, as the fleet apps do); `NetGuard` resolves the host once for the check and
-  once for the request.
+- **Limits stated in SECURITY.md**: rate limiting is per process (and keyed by `client_ip`, the Nth `X-Forwarded-For` entry from the right, see 7.12; run uvicorn with
+  `forwarded_allow_ips` limited to the proxy); `NetGuard` resolves the host once and the connection is pinned to that address when the
+  caller uses `resolve()`/`request_args()` (`LLMClient` does).
 - **Reporting**: GitHub private vulnerability reporting (see `SECURITY.md`).
 
 ## 10. Operations

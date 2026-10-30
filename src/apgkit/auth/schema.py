@@ -33,4 +33,5 @@ CREATE TABLE IF NOT EXISTS oidc_login (
     return_to   text NOT NULL DEFAULT '/',
     created_at  timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE oidc_login ADD COLUMN IF NOT EXISTS binding_hash text;
 """

@@ -11,6 +11,6 @@ from .env import Federation, from_env
 from .local import LocalAuth
 from .oidc import TokenError, TokenSource, TokenVerifier
 from .principal import AppAuth, Principal
-from .rp import RelyingParty
+from .rp import LoginStart, RelyingParty, clear_binding
 
-__all__ = ["AppAuth", "Authenticator", "Federation", "LocalAuth", "from_env", "Principal", "RelyingParty", "TokenError", "TokenSource", "TokenVerifier"]
+__all__ = ["AppAuth", "Authenticator", "Federation", "LocalAuth", "LoginStart", "from_env", "Principal", "RelyingParty", "clear_binding", "TokenError", "TokenSource", "TokenVerifier"]

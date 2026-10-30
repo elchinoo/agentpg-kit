@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 from apgkit import config, ids, passwords
 from apgkit.guard import SecurityGuard
 from apgkit.metrics import Metrics
-from apgkit.netguard import NetGuard, UnsafeURL
+from apgkit.netguard import NetGuard, Resolved, UnsafeURL
 from apgkit.ratelimit import FailureLimiter
 
 
@@ -187,7 +187,7 @@ def test_llm_client_reads_the_answer_bounded_and_types_its_errors(monkeypatch):
     from apgkit.llm import LLMClient, LLMError, LLMTimeout, LLMUnreachable
 
     guard = NetGuard("KIT_TEST_ALLOW")
-    monkeypatch.setattr(guard, "check", lambda u: u)
+    monkeypatch.setattr(guard, "resolve", lambda u: Resolved(u.rstrip("/"), "provider.test", 443, "https", None))
 
     def client_for(handler):
         return LLMClient(guard, http_factory=lambda: httpx.Client(transport=httpx.MockTransport(handler)))

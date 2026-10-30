@@ -7,4 +7,4 @@ a fix here is a fix everywhere; apps pick it up by moving to the new release tag
 Design points: tokens are verified with an algorithm allow-list and mandatory issuer/audience/expiry; sessions, tokens and
 keys are stored only as hashes; stored secrets are encrypted under a key that the database alone does not reveal; outbound URLs
 are checked on every call and redirects are never followed; browser writes need a custom header.
-Limits: rate limiting is per process; the SSRF guard resolves the host name once for the check and once for the request.
+Limits: rate limiting is per process; the SSRF guard resolves the host name once and apps that use `resolve()` connect to that pinned address.

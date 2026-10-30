@@ -258,40 +258,92 @@ def test_login_flow_pkce_state_nonce_and_single_use(db):
     idp = Provider()
     rp = RelyingParty(ISS, AUD, lambda: "s3cret", http=idp.http())
     with db.connect() as c:
-        url = rp.begin(c, "https://app.example.org/auth/callback", "/requests")
+        ls = rp.start(c, "https://app.example.org/auth/callback", "/requests")
+        url, bind = ls.url, ls.binding
         q = parse_qs(urlsplit(url).query)
         assert url.startswith(f"{ISS}/authorize?") and q["code_challenge_method"] == ["S256"] and q["scope"][0].startswith("openid")
         state, nonce, challenge = q["state"][0], q["nonce"][0], q["code_challenge"][0]
         idp.next_id_token = idp.sign(aud=AUD, nonce=nonce, roles=["demo:admin"], name="Ada")
-        claims, back, raw = rp.finish(c, "https://app.example.org/auth/callback", "the-code", state)
+        claims, back, raw = rp.finish(c, "https://app.example.org/auth/callback", "the-code", state, bind)
         assert claims["name"] == "Ada" and back == "/requests" and raw == idp.next_id_token
         sent = parse_qs(idp.token_requests[-1].content.decode())
         verifier = sent["code_verifier"][0]
         assert base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode() == challenge   # PKCE ties them
         assert sent["redirect_uri"] == ["https://app.example.org/auth/callback"]
         with pytest.raises(TokenError):                                                     # the state is single-use
-            rp.finish(c, "https://app.example.org/auth/callback", "the-code", state)
+            rp.finish(c, "https://app.example.org/auth/callback", "the-code", state, bind)
         with pytest.raises(TokenError):
-            rp.finish(c, "https://app.example.org/auth/callback", "code", "unknown-state")
+            rp.finish(c, "https://app.example.org/auth/callback", "code", "unknown-state", bind)
         # a stolen/misdirected ID token with the wrong nonce
-        url = rp.begin(c, "https://app.example.org/auth/callback")
+        ls = rp.start(c, "https://app.example.org/auth/callback")
+        url, bind = ls.url, ls.binding
         st = parse_qs(urlsplit(url).query)["state"][0]
         idp.next_id_token = idp.sign(aud=AUD, nonce="not-the-nonce")
         with pytest.raises(TokenError, match="does not belong"):
-            rp.finish(c, "https://app.example.org/auth/callback", "code", st)
+            rp.finish(c, "https://app.example.org/auth/callback", "code", st, bind)
         # an expired attempt
-        url = rp.begin(c, "https://app.example.org/auth/callback")
+        ls = rp.start(c, "https://app.example.org/auth/callback")
+        url, bind = ls.url, ls.binding
         st = parse_qs(urlsplit(url).query)["state"][0]
         c.execute("UPDATE oidc_login SET created_at = now() - interval '1 hour'")
         c.commit()
         with pytest.raises(TokenError, match="expired"):
-            rp.finish(c, "https://app.example.org/auth/callback", "code", st)
+            rp.finish(c, "https://app.example.org/auth/callback", "code", st, bind)
         # the provider refusing the code
-        url = rp.begin(c, "https://app.example.org/auth/callback")
+        ls = rp.start(c, "https://app.example.org/auth/callback")
+        url, bind = ls.url, ls.binding
         st = parse_qs(urlsplit(url).query)["state"][0]
         idp.status = 400
         with pytest.raises(TokenError, match="refused"):
-            rp.finish(c, "https://app.example.org/auth/callback", "code", st)
+            rp.finish(c, "https://app.example.org/auth/callback", "code", st, bind)
+
+
+@needs_db
+def test_callback_without_the_binding_cookie_is_refused_and_burns_the_state(db):
+    from fastapi import Response
+
+    from apgkit.auth.rp import BINDING_COOKIE, clear_binding
+    from apgkit.auth.schema import SQL
+    with db.connect() as c:
+        c.execute(SQL)
+        c.commit()
+    idp = Provider()
+    rp = RelyingParty(ISS, AUD, None, http=idp.http())
+    cb = "https://app.example.org/auth/callback"
+    with db.connect() as c:
+        for cookie in (None, "", "wrong", "0" * 64):                     # a victim's browser: no cookie, or somebody else's
+            ls = rp.start(c, cb)
+            q = parse_qs(urlsplit(ls.url).query)
+            idp.next_id_token = idp.sign(aud=AUD, nonce=q["nonce"][0])
+            with pytest.raises(TokenError, match="not started in this browser"):
+                rp.finish(c, cb, "code", q["state"][0], cookie)
+            with pytest.raises(TokenError, match="unknown or expired"):  # single use even when refused
+                rp.finish(c, cb, "code", q["state"][0], ls.binding)
+        # the cookie of another login attempt does not fit this one
+        a, b = rp.start(c, cb), rp.start(c, cb)
+        qb = parse_qs(urlsplit(b.url).query)
+        idp.next_id_token = idp.sign(aud=AUD, nonce=qb["nonce"][0])
+        with pytest.raises(TokenError, match="not started in this browser"):
+            rp.finish(c, cb, "code", qb["state"][0], a.binding)
+        # a row without a stored binding (created by an older kit) never passes
+        ls = rp.start(c, cb)
+        q = parse_qs(urlsplit(ls.url).query)
+        c.execute("UPDATE oidc_login SET binding_hash = NULL WHERE state=%s", (q["state"][0],))
+        c.commit()
+        with pytest.raises(TokenError, match="not started in this browser"):
+            rp.finish(c, cb, "code", q["state"][0], ls.binding)
+        # the happy path with the cookie works
+        ls = rp.start(c, cb)
+        q = parse_qs(urlsplit(ls.url).query)
+        idp.next_id_token = idp.sign(aud=AUD, nonce=q["nonce"][0])
+        assert rp.finish(c, cb, "code", q["state"][0], ls.binding)[0]["nonce"] == q["nonce"][0]
+    resp = Response()
+    ls.bind(resp)
+    header = resp.headers["set-cookie"].lower()
+    assert header.startswith(f"{BINDING_COOKIE}=") and "httponly" in header and "secure" in header and "samesite=lax" in header
+    assert "max-age=600" in header and ls.binding not in (q["state"][0], q["nonce"][0])
+    clear_binding(resp)
+    assert 'max-age=0' in resp.headers.getlist("set-cookie")[-1].lower()
 
 
 @needs_db
@@ -303,9 +355,10 @@ def test_public_client_sends_client_id_instead_of_a_secret(db):
     idp = Provider()
     rp = RelyingParty(ISS, AUD, None, http=idp.http())
     with db.connect() as c:
-        q = parse_qs(urlsplit(rp.begin(c, "https://a.example.org/cb")).query)
+        ls = rp.start(c, "https://a.example.org/cb")
+        q = parse_qs(urlsplit(ls.url).query)
         idp.next_id_token = idp.sign(nonce=q["nonce"][0])
-        rp.finish(c, "https://a.example.org/cb", "code", q["state"][0])
+        rp.finish(c, "https://a.example.org/cb", "code", q["state"][0], ls.binding)
     req = idp.token_requests[-1]
     assert "authorization" not in req.headers and parse_qs(req.content.decode())["client_id"] == [AUD]
     assert rp.logout_url("hint", "https://a.example.org/").startswith(f"{ISS}/logout?")
@@ -316,7 +369,7 @@ def test_public_client_sends_client_id_instead_of_a_secret(db):
 def test_authenticator_accepts_every_credential_kind(db, tmp_path, monkeypatch):
     from apgkit.auth.schema import SQL
     monkeypatch.delenv("DEMO_API_KEY", raising=False)
-    monkeypatch.setenv("DEMO_API_KEY", "static-key-value")
+    monkeypatch.setenv("DEMO_API_KEY", "static-key-value-0123456789-abcdefghij")
     with db.connect() as c:
         c.execute(SQL)
         c.commit()
@@ -337,8 +390,8 @@ def test_authenticator_accepts_every_credential_kind(db, tmp_path, monkeypatch):
     c = TestClient(app)
     H = lambda t: {"Authorization": f"Bearer {t}"}  # noqa: E731
     assert c.get("/read").status_code == 401                                              # nothing presented
-    assert c.get("/read", headers=H("static-key-value")).json()["kind"] == "static"
-    assert c.get("/write", headers=H("static-key-value")).status_code == 200              # the static key is full access
+    assert c.get("/read", headers=H("static-key-value-0123456789-abcdefghij")).json()["kind"] == "static"
+    assert c.get("/write", headers=H("static-key-value-0123456789-abcdefghij")).status_code == 200              # the static key is full access
     jwt_viewer = idp.sign(roles=["demo:viewer"])
     r = c.get("/read", headers=H(jwt_viewer))
     assert r.status_code == 200 and r.json() == {"who": "usr_1", "kind": "user", "source": "oidc"}
@@ -374,7 +427,7 @@ def test_authenticator_rate_limits_bad_credentials_and_anonymous_opt_in(db, monk
     c = TestClient(app)
     codes = [c.get("/x", headers={"Authorization": "Bearer bad"}).status_code for _ in range(12)]
     assert codes[:10] == [401] * 10 and codes[10:] == [429, 429]
-    anon = Authenticator(APP, local, db, cookie_name="s", allow_anonymous=True)
+    anon = Authenticator(APP, local, db, cookie_name="s", allow_anonymous=True, bind_host="127.0.0.1")
     app2 = FastAPI()
 
     @app2.get("/x")
