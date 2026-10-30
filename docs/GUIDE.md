@@ -169,7 +169,7 @@ Design choices worth knowing:
 
 - **State lives in Postgres.** Sessions, API tokens (hashes), OIDC login state, the vault's wrapped keys and the admin password
   hash are all rows. An app can restart or run several replicas and keep its sessions.
-- **Fail closed.** With no admin password and no static key, `LocalAuth.needs_setup()` is true and the app should offer setup, not
+- **Fail closed.** With no admin password and no usable static key (a refused, too-short key does not count), `LocalAuth.needs_setup()` is true and the app should offer setup, not
   access. Anonymous access exists only if the app passes `allow_anonymous` (CityPulse reads `CITYPULSE_ALLOW_ANONYMOUS`).
 - **Database may be asleep.** `Database.connect()` retries `OperationalError` with doubling delays (1 s, 2 s, 4 s...) and says why on
   stderr. `Database(pool_wait=False)` opens the pool without blocking so the process starts and a request during wake-up fails fast.
@@ -271,7 +271,7 @@ stderr and gives an empty string.
 | Variable | Default file | Read by | Meaning |
 |---|---|---|---|
 | `<PREFIX>_ENCRYPTION_KEY` (+ `_FILE`) | `/etc/<prefix>/encryption_key` (prefix lower-cased) | `Vault` | The platform secret that wraps the vault data key so the vault unlocks at start without the admin password. Empty: the vault needs the admin password after every restart. |
-| `<PREFIX>_API_KEY` (+ `_FILE`) | `/etc/<prefix>/api_key` | `LocalAuth.static_key` | A full-access static credential for automation. At least 32 characters or it is never accepted (an error is logged); a warning is logged at startup whenever one is enabled. Prefer scoped API tokens. Presence also disables the first-run setup flow (`needs_setup` is false) and makes `static_key_configured()` true. |
+| `<PREFIX>_API_KEY` (+ `_FILE`) | `/etc/<prefix>/api_key` | `LocalAuth.static_key` | A full-access static credential for automation. At least 32 characters or it is never accepted (an error is logged); a warning is logged at startup whenever one is enabled. Prefer scoped API tokens. A usable key (32+ characters) also disables the first-run setup flow (`needs_setup` is false, `static_key_usable()` is true); a refused short key does not (`needs_setup` stays true), though `static_key_configured()` is true for any value. |
 | `<PREFIX>_OIDC_CLIENT_SECRET` (+ `_FILE`) | none | `from_env` | The app's confidential-client secret at the identity provider. Empty at start means a **public client** (PKCE only, `client_id` sent in the token request). |
 
 ### 5.3 Federation (`apgkit.auth.from_env(prefix, default_client_id)`)
@@ -360,7 +360,7 @@ The kit supplies the mechanics but **not the HTTP routes**: `/api/session`, `/ap
 1. Open `http://127.0.0.1:8790/`. You see "Set up Notes". Enter the setup code from the log and an admin password of at least 12
    characters twice, then "Create admin password". A toast says you are signed in and the notes screen shows "No notes yet."
 2. Add a note ("First", "hello"). Add another with "Private (encrypted in the vault)" ticked. Both appear; the private one has a badge.
-3. In `psql`, `SELECT title, body, private FROM note;`: the private body is a `gAAAAA...` Fernet token, not your text.
+3. In `psql`, `SELECT title, body, private FROM note;`: the private body is a `v2$...` vault token (AES-256-GCM), not your text.
 4. Click Delete on a note: the shared confirmation dialog appears; Delete removes it.
 5. Stop the server and start it again **without** `NOTES_ENCRYPTION_KEY`. Reload: a banner "Provider keys are locked." appears and
    the private note's text shows "locked". Type the admin password in the banner and Unlock: the text returns without a page
@@ -525,6 +525,31 @@ with db.connect() as conn:            # idle connection
 
 `vault.stores()` lists what is registered (useful in a test that fails when a new encrypted column is not registered).
 
+Settings kept in `app_setting`: `vault.register_setting(key)` is the shortcut for the common case. It registers a store named
+`app_setting.<key>` with the select and update SQL written for you and the context `app_setting.<key>`, and returns that context:
+
+```python
+ctx = vault.register_setting("llm_api_key")                       # "app_setting.llm_api_key"
+settings_store.put(conn, "llm_api_key", vault.encrypt(secret, ctx))
+secret = vault.decrypt(settings_store.get(conn, "llm_api_key"), ctx)
+```
+
+A key that is not stored yet is skipped by a rotation (count 0). The key may use letters, digits and `_ . : -` only.
+
+Migrating rows that were written without a context: `apgkit.vault.legacy_decrypt_fallback(vault, token, context, *, reencrypt=None)`
+tries `context` first, then the empty context (which also covers legacy Fernet tokens). When the value was only readable the old
+way and you pass `reencrypt`, it is called with the plaintext sealed under `context` so you can store it back:
+
+```python
+from apgkit.vault import legacy_decrypt_fallback
+secret = legacy_decrypt_fallback(vault, row["api_key_enc"], f"provider.api_key_enc:{row['id']}",
+                                 reencrypt=lambda t: conn.execute("UPDATE provider SET api_key_enc=%s WHERE id=%s", (t, row["id"])))
+```
+
+A locked vault raises `VaultLocked` immediately; when neither context opens the token the error is the one for the real context.
+Use it only during the migration window, then go back to a plain `decrypt(token, context)` so a ciphertext moved to another row can
+never be accepted through the empty context.
+
 Other operations: `rotate_platform_secret(conn, new_secret)` (unlocked; also set the new value in the platform's environment);
 `drop_platform_wrap(conn)` (switch to admin-password-only mode; refuses when it is the only wrap).
 
@@ -630,7 +655,7 @@ embeddings; the kit has no embeddings helper). Errors: `LLMError`, `LLMTimeout`,
 
 ### 7.8 `FailureLimiter`
 
-`limited(client)`, `record(client)`, `clear()`. Memory is bounded (`max_clients`, default 10 000) by eviction, never by a reset: when
+`limited(client)`, `record(client)`, `forgive(client)` (takes back the client's newest failure; `LocalAuth.login_password` calls it for a successful or never-judged attempt), `clear()`. Memory is bounded (`max_clients`, default 10 000) by eviction, never by a reset: when
 the table is over the cap, clients whose failures all left the window go first, then the least recently failed client, one at a time.
 Looking up a client that never failed adds nothing. Only more than `max_clients` simultaneously active failing addresses can push a
 limited client out.
@@ -923,6 +948,48 @@ migrates, tries the platform secret, and otherwise shows the vault banner for th
 | LLM call count higher than expected on the gateway | `LLMClient` retries each transient failure up to 3 times | Account for up to 4 gateway requests per failed call (this was the cause of one earlier budget burn, per `ecosystem/docs/01`). |
 | No setup code in the log | An admin password or static key already exists, federation is on, or the database was asleep at start | Reset with the app's reset command, or request `/api/session` once (apps print the code on the first request that finds setup required). |
 
+### 10.5 Operating the vault after an exposure
+
+Use this when the database (or a backup), the platform secret, or the admin password may have been seen by someone who should not
+have it. Two facts decide everything: the vault protects stored values with ONE data key, and a copy of the database is a copy of
+every ciphertext at that moment.
+
+**What rotating the platform secret does and does not do.** `rotate_platform_secret` (or changing `<PREFIX>_ENCRYPTION_KEY`, which the
+next password unlock re-wraps) re-wraps the SAME data key under the new secret. It protects rows copied from now on only against
+someone holding the old secret and a new database copy. It does NOT help against anyone who already holds a copy of the old wrap row
+and the old secret: they still recover the data key and decrypt every ciphertext they copied. `change_password` has the same limit
+for the admin password. Old backups keep decrypting with the old key whatever you do afterwards.
+
+**Procedure** (per app, one at a time; the order within an app matters):
+
+1. Stop writers of vault-encrypted columns and note which values the app keeps (table below). Back up first; the backup is as
+   exposed as the database, so protect it.
+2. Set the NEW platform secret in the platform's environment (a long random value, for example `openssl rand -base64 36`) and keep the
+   process unlocked with the admin password (sign in). If the admin password may be exposed, change it first (`change_password`).
+3. Call `vault.rotate_data_key(conn, password=admin_password)` on an idle connection, with every encrypted column registered
+   (`register_store`, `register_setting`) or covered by your callback. One transaction: new data key, all rows, both wraps.
+4. Restart every other process of the app (they hold the old key in memory), then check `/readyz` and the vault status
+   (`unlocked`, `auto_unlock`, no `platform_key_mismatch`).
+5. Re-issue the underlying secrets at their source and store the new values: revoke the provider key, regenerate the webhook secret,
+   issue a new signing key. Rotating the data key protects what is stored from now on; anyone who copied the old
+   ciphertexts together with the old key material can still read those plaintexts, so the old values must stop working.
+6. Revoke sessions and API tokens (`DELETE FROM web_session`, `LocalAuth.revoke_token`) if the admin password was exposed.
+
+**What each ecosystem app keeps in its vault** (re-issue these in step 5):
+
+| App | Values in the vault |
+|---|---|
+| identity | token signing keys; federation (client) secrets |
+| gateway | provider API keys |
+| trustdesk | each account's LLM key |
+| pagerlens | each account's LLM key |
+| paybroker | webhook secrets; the LLM key; the card fingerprint key |
+| shopfront | PayBroker keys; the order token key |
+| simulator | saved credentials |
+
+A key derived with `Vault.derive_key(purpose)` (for example an HMAC key) changes when the data key is rotated: anything signed or
+fingerprinted with the old one stops matching, so plan for that (for example keep the old value until the new one is in place).
+
 ## 11. Testing and development
 
 ```bash
@@ -983,7 +1050,7 @@ Limitations of the kit (verified in code):
 - **No multi-replica safety for migrations or the setup code.** Migrations are unlocked (use an advisory lock). The setup code is per
   process: with several replicas the code printed by the replica that did not serve your request is wrong.
 - **Rate limiting is per process** and keyed by remote address.
-- **No vault data-key rotation.** Platform-secret rotation needs no helper: unlock once with the admin password (see 10.3).
+- **Data-key rotation re-encrypts, it does not re-issue.** Platform-secret rotation needs no helper (unlock once with the admin password, see 10.3); after an exposure use `rotate_data_key` and re-issue the secrets themselves (10.5).
 - **`vault.py` shares `app_setting` keys** `vault_salt`, `vault_wrap_pw`, `vault_env_salt`, `vault_wrap_env` and `settings_store` keys
   `admin_password_hash`; do not reuse those names.
 - **Shared UI is partly product-flavoured**: the vault banner text says "Provider keys are locked ... (external embeddings and Ask are

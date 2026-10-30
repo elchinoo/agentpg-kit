@@ -130,6 +130,12 @@ pytest -q
 
 ## Changelog
 
+### Unreleased (toward 0.4.1)
+- New: `FailureLimiter.forgive(client)` (takes back a client's newest failure); `LocalAuth.login_password` uses it instead of touching the limiter's table, so a custom limiter passed to it must provide `forgive`.
+- Fix: `LocalAuth.needs_setup` no longer treats a refused static API key (shorter than 32 characters) as "set up". New `LocalAuth.static_key_usable()`; `static_key_configured()` is unchanged.
+- New: `Vault.register_setting(key)` (store, SQL and context `app_setting.<key>` for an encrypted `app_setting` value; returns the context) and `apgkit.vault.legacy_decrypt_fallback(vault, token, context, reencrypt=None)` for migrating rows written without a context. See GUIDE 7.3.1.
+- Docs: GUIDE 10.5 "Operating the vault after an exposure". The Notes example binds the uvicorn forwarded-address list to `NOTES_FORWARDED_ALLOW_IPS` (default 127.0.0.1) instead of `"*"`, passes `bind_host` to the `Authenticator`, uses a vault context for private notes and the limiter-aware `login_password`.
+
 ### 0.4.0
 - Hardening (vault v2): new ciphertexts are `v2$<key id>$...` AES-256-GCM tokens under an HKDF-SHA256 subkey of the data key, bound to a caller-supplied `context` (`encrypt(plaintext, context="")`, `decrypt(token, context="")`; contexts are optional, calls without one bind nothing). Legacy Fernet tokens still decrypt; `rotate_data_key` upgrades them and `Vault.reencrypt_legacy` upgrades single values. `register_store(..., context=template)`, `Vault.derive_key(purpose)`, `Vault.has_password_wrap`. Key wraps are AES-256-GCM bound to their slot. See GUIDE 7.3.0.
 - Hardening: the platform-secret wrap uses HKDF-SHA256 when the secret is long and random (at least 32 decoded bytes or 43 url-safe characters), scrypt otherwise; the KDF name is stored in `vault_kdf_env` and old wraps are read and upgraded. Unlocking with a generated key no longer costs 128 MiB.
