@@ -4,6 +4,7 @@ Tokens are JWTs signed with an asymmetric key (RS256, ES256 or EdDSA; `none` and
 closes the key-confusion attack). The public keys come from the provider's JWKS and are cached; an unknown `kid` triggers one
 refresh (rate limited) so key rotation needs no restart. Checked: signature, issuer, audience, expiry and not-before.
 """
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -18,6 +19,21 @@ from joserfc.jwt import JWTClaimsRegistry
 from .principal import AppAuth, Principal
 
 ALGORITHMS = ["RS256", "ES256", "EdDSA"]
+# How long a fetched JWKS is trusted. A signing key the provider removes (an emergency rotation) is refused once this has passed, so it is
+# short by default and capped: a larger value passed in is lowered to MAX_JWKS_TTL. If the provider cannot be reached when the cache
+# expires, the old keys are still used, but only for MAX_STALE seconds after the last successful fetch, then verification fails closed.
+DEFAULT_JWKS_TTL = 300.0
+MAX_JWKS_TTL = 3600.0
+MAX_STALE = 3600.0
+
+
+def jwks_ttl_from_env(prefix: str) -> float | None:
+    """`<PREFIX>_OIDC_JWKS_TTL` in seconds (1 to MAX_JWKS_TTL); unset or invalid means the default."""
+    try:
+        v = float(os.environ.get(f"{prefix.upper()}_OIDC_JWKS_TTL", ""))
+    except ValueError:
+        return None
+    return min(v, MAX_JWKS_TTL) if v >= 1 else None
 
 
 class TokenError(Exception):
@@ -53,9 +69,10 @@ def discover(issuer: str, http: Callable[[], httpx.Client] = _client_factory) ->
 
 class TokenVerifier:
     def __init__(self, issuer: str, audience: str, *, jwks_url: str | None = None, http: Callable[[], httpx.Client] = _client_factory,
-                 leeway: int = 30, ttl: float = 600.0, min_refresh: float = 15.0):
+                 leeway: int = 30, ttl: float | None = None, min_refresh: float = 15.0, max_stale: float = MAX_STALE):
         self.issuer, self.audience = check_issuer_url(issuer), audience
-        self._jwks_url, self._http, self.leeway, self.ttl, self.min_refresh = jwks_url, http, leeway, ttl, min_refresh
+        self._jwks_url, self._http, self.leeway, self.min_refresh, self.max_stale = jwks_url, http, leeway, min_refresh, max_stale
+        self.ttl = DEFAULT_JWKS_TTL if ttl is None else max(0.0, min(float(ttl), MAX_JWKS_TTL))
         self._keys = None
         self._fetched = 0.0
         self._lock = threading.Lock()
@@ -76,8 +93,8 @@ class TokenVerifier:
             with self._http() as c:
                 r = c.get(self._jwks_endpoint())
             if r.status_code != 200:
-                if self._keys is not None:
-                    return self._keys                   # keep serving with the keys we have
+                if self._keys is not None and now - self._fetched < self.max_stale:
+                    return self._keys                   # keep serving with the keys we have, for a bounded time
                 raise TokenError(f"cannot fetch the signing keys (HTTP {r.status_code})")
             self._keys = KeySet.import_key_set(r.json())
             self._fetched = now

@@ -14,7 +14,14 @@ from joserfc import jwt
 from joserfc.jwk import RSAKey
 
 from apgkit.auth import AppAuth, Authenticator, LocalAuth, TokenError, TokenSource, TokenVerifier
-from apgkit.auth.oidc import check_issuer_url, discover, principal_from_claims
+from apgkit.auth.env import from_env
+from apgkit.auth.oidc import (
+    MAX_JWKS_TTL,
+    check_issuer_url,
+    discover,
+    jwks_ttl_from_env,
+    principal_from_claims,
+)
 from apgkit.auth.rp import RelyingParty, safe_return_to
 
 ISS, AUD = "https://id.example.org", "demo-client"
@@ -46,6 +53,8 @@ class Provider:
                                              "token_endpoint": f"{ISS}/token", "end_session_endpoint": f"{ISS}/logout"})
         if path == "/jwks":
             self.jwks_calls += 1
+            if getattr(self, "jwks_status", 200) != 200:
+                return httpx.Response(self.jwks_status)
             return httpx.Response(200, json=self.keyset())
         if path == "/token":
             self.token_requests.append(request)
@@ -139,6 +148,55 @@ def test_unknown_kid_refreshes_are_rate_limited(idp):
         with pytest.raises(TokenError):
             v.verify(idp.sign(key=mint_key("rogue")))
     assert idp.jwks_calls == 1                  # an attacker cannot make us hammer the provider
+
+
+class _Clock:
+    def __init__(self, monkeypatch):
+        self.t = 1000.0
+        monkeypatch.setattr("apgkit.auth.oidc.time.monotonic", lambda: self.t)
+
+
+def test_a_key_the_provider_removed_is_refused_after_the_cache_ttl(idp, monkeypatch):
+    clock = _Clock(monkeypatch)
+    v = verifier(idp)                                               # default TTL
+    assert v.ttl == 300.0                                           # bounded and short by default
+    old = idp.sign()
+    assert v.verify(old)["sub"] == "usr_1"
+    idp.key = mint_key("k2")                                        # emergency rotation: k1 is gone from the JWKS at once
+    clock.t += v.ttl - 1
+    assert v.verify(old)["sub"] == "usr_1"                          # inside the TTL the cached keys still verify it
+    clock.t += 2
+    with pytest.raises(TokenError):
+        v.verify(old)                                               # past the TTL the removed key is refused
+    assert v.verify(idp.sign())["sub"] == "usr_1"                   # and the new key works
+
+
+def test_the_jwks_cache_ttl_is_capped_and_configurable(idp, monkeypatch):
+    assert verifier(idp, ttl=10**9).ttl == MAX_JWKS_TTL            # an unbounded value is lowered
+    assert verifier(idp, ttl=60).ttl == 60
+    monkeypatch.setenv("DEMO_OIDC_JWKS_TTL", "120")
+    assert jwks_ttl_from_env("demo") == 120
+    monkeypatch.setenv("DEMO_OIDC_JWKS_TTL", "99999")
+    assert jwks_ttl_from_env("demo") == MAX_JWKS_TTL
+    for bad in ("", "x", "0", "-5"):
+        monkeypatch.setenv("DEMO_OIDC_JWKS_TTL", bad)
+        assert jwks_ttl_from_env("demo") is None
+    monkeypatch.setenv("DEMO_OIDC_JWKS_TTL", "120")
+    monkeypatch.setenv("DEMO_OIDC_ISSUER", ISS)
+    assert from_env("demo", "demo").verifier.ttl == 120
+
+
+def test_stale_keys_are_used_only_for_a_bounded_time_when_the_provider_is_down(idp, monkeypatch):
+    clock = _Clock(monkeypatch)
+    v = verifier(idp, max_stale=1800)
+    tok = idp.sign()
+    assert v.verify(tok)["sub"] == "usr_1"
+    idp.jwks_status = 503
+    clock.t += v.ttl + 1
+    assert v.verify(tok)["sub"] == "usr_1"                          # provider down: keep serving, for now
+    clock.t += 1800
+    with pytest.raises(TokenError):
+        v.verify(tok)                                               # too long without a successful fetch: fail closed
 
 
 def test_discovery_must_report_the_configured_issuer(idp):

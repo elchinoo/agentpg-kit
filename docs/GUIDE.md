@@ -279,6 +279,7 @@ stderr and gives an empty string.
 | Variable | Default | Meaning |
 |---|---|---|
 | `<PREFIX>_OIDC_ISSUER` | unset | The identity provider's issuer URL. **Unset turns federation off**: `Federation.enabled` is false, `verifier` and `rp` are `None`, `local_login` is true. Must be https (http only for `localhost`, `127.0.0.1`, `::1`, `*.localhost`), no credentials, query or fragment, otherwise `ValueError` at start. |
+| `<PREFIX>_OIDC_JWKS_TTL` | `300` | Seconds the verifier trusts a fetched JWKS (1 to 3600; larger values are lowered to 3600). A signing key the identity provider removes (an emergency rotation) is refused once this has passed; an unknown `kid` also triggers one rate-limited refresh. If the provider is unreachable at refresh time the cached keys are used for at most one more hour, then verification fails closed. |
 | `<PREFIX>_OIDC_CLIENT_ID` | the app name passed as `default_client_id` | This app's client id; also the **audience** `TokenVerifier` requires. |
 | `<PREFIX>_OIDC_CLIENT_SECRET` | empty | See 5.2. |
 | `<PREFIX>_LOCAL_LOGIN` | `true` | Whether the local admin password remains a login when federation is on. The kit only reports the flag in `Federation.local_login`; **the app must enforce it** (CityPulse's `/api/login` returns 403 when federation is on and this is false). |

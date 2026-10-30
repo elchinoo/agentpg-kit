@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass
 
 from ..config import env_bool, read_secret
-from .oidc import TokenVerifier
+from .oidc import TokenVerifier, jwks_ttl_from_env
 from .rp import RelyingParty
 
 
@@ -34,5 +34,5 @@ def from_env(prefix: str, default_client_id: str) -> Federation:
     if not issuer:
         return Federation("", client_id, None, None, True)
     secret = lambda: read_secret(f"{prefix}_OIDC_CLIENT_SECRET")  # noqa: E731
-    return Federation(issuer.rstrip("/"), client_id, TokenVerifier(issuer, client_id), RelyingParty(issuer, client_id, secret if secret() else None),
+    return Federation(issuer.rstrip("/"), client_id, TokenVerifier(issuer, client_id, ttl=jwks_ttl_from_env(prefix)), RelyingParty(issuer, client_id, secret if secret() else None),
                       local_login)
