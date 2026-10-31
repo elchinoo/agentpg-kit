@@ -1,6 +1,6 @@
 # agentpg-kit guide
 
-Version described: **0.4.0** (`apgkit.__version__` is the single source; `pyproject.toml` reads it). Everything below was checked against the
+Version described: **0.4.1** (`apgkit.__version__` is the single source; `pyproject.toml` reads it). Everything below was checked against the
 source in `src/apgkit`, the tests in `tests/`, and the way the other projects of the ecosystem use the kit. Where a statement could
 not be verified it is listed under [Known limitations](#13-known-limitations-and-things-not-verified).
 
