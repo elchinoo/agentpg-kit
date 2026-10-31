@@ -578,6 +578,30 @@ at the scrypt cost above) or a running unlocked process. What you lose:
 
 The default (platform secret set) is unchanged.
 
+#### 7.3.3 Sealed boot: no secret in the environment, files or image (since 0.4.1)
+
+An unlock key in the environment or a file defeats the vault: whoever reads the platform's configuration reads the key. Sealed boot
+removes every start-up secret from those places.
+
+1. **Seal** (operator's machine): `blob = sealed.seal({"DATABASE_URL": "...", "OIDC_CLIENT_SECRET": "...", "LLMGW_API_KEY": "..."}, passphrase)`.
+   The blob is AES-256-GCM under a scrypt key (N=2^17). Deploy it as `APGKIT_SEALED` (or a file named by `APGKIT_SEALED_FILE`). It is
+   ciphertext; the passphrase is never stored on the platform (use a password manager; `sealed.generate_passphrase()` makes one).
+2. **Start sealed**: in the app, `s = sealed.Sealed.from_env(); sealed.install(app, s)`, then put start-up work in
+   `s.on_unsealed(callback)`: connect, `vault.unlock_sealed(conn, passphrase)`, migrate. With no blob configured nothing changes
+   (callbacks run at once), so development and tests are unaffected.
+3. **Unseal**: `GET /_seal/key`, then `POST /_seal/unseal` with `sealed.make_envelope(public_key, passphrase)`. The passphrase is
+   encrypted to a key that exists only in that process, so the platform proxy and logs see ciphertext. Five failures per client per
+   minute (30 overall) answer 429. A callback that fails (database down, wrong vault passphrase) leaves the app sealed.
+4. **Read secrets as before**: while unsealed, `config.read_secret(name)` and `config.database_url()` return the sealed values first.
+   A restart, or `s.seal_again()`, forgets them and the app is sealed again.
+
+Memory: the vault's data key, the unsealed secrets and the passphrase are `sealed.Protected`: held as `value XOR pad` in two locked,
+dump-excluded pages and re-masked every `APGKIT_REMASK_SECONDS` (default 15), revealed only inside `with p.reveal() as buf` (zeroed
+afterwards). Call `sealed.harden_process()` (done by `install`) to turn off core dumps and ptrace by other users. Be clear about the
+limit: this defeats `strings`, swap, a core file and a partial memory disclosure; it does not defeat an attacker with debugger-level
+access to the running process, who can read both pages. Python also makes transient `str` copies when a library needs text (a
+database URL); they are short-lived and never stored.
+
 ### 7.4 Authentication
 
 `AppAuth(name, audience, role_permissions, scope_permissions)` declares the model; `Principal.can("x:y")` is the only check code

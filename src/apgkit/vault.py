@@ -38,6 +38,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from . import passwords
 from . import settings_store as store
 from .config import read_secret
+from .sealed import Protected, active
 
 _K_SALT, _K_PW, _K_ENV_SALT, _K_ENV = "vault_salt", "vault_wrap_pw", "vault_env_salt", "vault_wrap_env"
 _K_KDF_PW, _K_KDF_ENV = "vault_kdf_pw", "vault_kdf_env"
@@ -196,7 +197,7 @@ class Vault:
     def __init__(self, env_prefix: str):
         self.env_prefix = env_prefix.upper()
         self._lock = threading.Lock()
-        self._data_key: bytes | None = None
+        self._dk: Protected | None = None            # the data key, masked in locked pages (see sealed.Protected)
         self._env_proved: bytes | None = None   # digest of the platform secret that opened (or wrote) the stored wrap in this process
         self._env_ok: bool | None = None     # did the current platform secret open the stored wrap? None = not tried yet
         self._rot = threading.RLock()        # held while the data key is replaced: encrypt/decrypt wait for it
@@ -206,7 +207,24 @@ class Vault:
         self._env_ok = True if env else None
         self._env_proved = hashlib.sha256(env.encode()).digest() if env else None
 
+    @property
+    def _data_key(self) -> bytes | None:
+        dk = self._dk
+        if dk is None:
+            return None
+        with dk.reveal() as buf:
+            return bytes(buf)                            # a short-lived copy for one cryptographic operation
+
+    @_data_key.setter
+    def _data_key(self, value: bytes | None) -> None:
+        old, self._dk = self._dk, (Protected(value) if value is not None else None)
+        if old is not None:
+            old.wipe()
+
     def _env_secret(self) -> str:
+        sealed = active()
+        if sealed is not None and sealed.enabled:        # sealed boot: the only unlock secret is the operator's passphrase
+            return ""
         return read_secret(f"{self.env_prefix}_ENCRYPTION_KEY", f"/etc/{self.env_prefix.lower()}/encryption_key")
 
     def _env_kdf(self, secret: str) -> str:
@@ -249,7 +267,7 @@ class Vault:
         return store.get(conn, _K_PW) is not None or store.get(conn, _K_ENV) is not None
 
     def is_unlocked(self) -> bool:
-        return self._data_key is not None
+        return self._dk is not None
 
     def lock(self) -> None:
         with self._lock:
@@ -340,6 +358,18 @@ class Vault:
             except Exception:
                 conn.rollback()
         return True
+
+    def unlock_sealed(self, conn, passphrase: Protected) -> str:
+        """Sealed boot: open the vault with the operator's passphrase, creating it on first start. Returns `unlocked` or `initialized`.
+        Raises VaultLocked when the vault exists and the passphrase does not open it."""
+        with passphrase.reveal() as buf:
+            text = buf.decode()
+            if not self.is_initialized(conn):
+                self.initialize(conn, text)
+                return "initialized"
+            if not self.unlock_with_password(conn, text):
+                raise VaultLocked("the passphrase does not open this vault")
+            return "unlocked"
 
     def change_password(self, conn, new_password: str) -> None:
         """Re-wrap the data key under a new password. Requires the vault to be unlocked."""

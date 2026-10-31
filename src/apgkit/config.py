@@ -10,7 +10,8 @@ def read_secret(env: str, default_file: str = "") -> str:
 
     Platforms that can only mount files (or that should not put secrets in the environment) can still supply it.
     """
-    value = os.environ.get(env, "")
+    from .sealed import sealed_secret
+    value = sealed_secret(env) or os.environ.get(env, "")
     if value:
         return value
     path = os.environ.get(f"{env}_FILE", default_file)
@@ -29,7 +30,10 @@ def read_secret(env: str, default_file: str = "") -> str:
 def database_url() -> str:
     """First match wins. An empty DSN makes libpq fall back to PGHOST, PGUSER, PGPASSWORD, PGDATABASE, which linked
     AgentPG sandboxes also provide."""
+    from .sealed import sealed_secret
     for name in DATABASE_ENV_NAMES:
+        if sealed_secret(name):
+            return sealed_secret(name)
         if os.environ.get(name):
             return os.environ[name]
     return ""
