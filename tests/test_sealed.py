@@ -148,11 +148,44 @@ def test_seal_again_forgets_everything():
     assert s.state == "sealed" and s.get("a") is None
 
 
-def test_disabled_runs_callbacks_immediately():
-    ran = []
+def test_disabled_never_runs_callbacks_and_runs_the_lifespan_as_before():
+    import contextlib
+    ran, life = [], []
     s = sl.Sealed(None)
     s.on_unsealed(lambda *_: ran.append(1))
-    assert ran == [1] and s.unsealed and s.state == "disabled"
+
+    @contextlib.asynccontextmanager
+    async def inner(app):
+        life.append("start")
+        yield
+        life.append("stop")
+    app = FastAPI(lifespan=s.deferred(inner))
+    with TestClient(app):
+        assert life == ["start"]
+    assert ran == [] and s.unsealed and s.state == "disabled" and life == ["start", "stop"]
+
+
+def test_deferred_lifespan_starts_only_after_unseal():
+    import contextlib
+    life = []
+
+    @contextlib.asynccontextmanager
+    async def inner(app):
+        life.append("start")
+        yield
+        life.append("stop")
+    s = sl.Sealed(sl.seal({"a": "b"}, PASS))
+    app = FastAPI(lifespan=s.deferred(inner))
+    sl.install(app, s, trusted_hops=0, harden=False)
+    with TestClient(app) as c:
+        assert life == []
+        assert unseal(c, PASS).status_code == 200
+        for _ in range(50):
+            if life:
+                break
+            time.sleep(0.1)
+        assert life == ["start"]
+    assert life == ["start", "stop"]
 
 
 def test_harden_process_reports():
@@ -173,3 +206,29 @@ def test_vault_unlock_sealed_and_platform_key_ignored(monkeypatch):
     v = Vault("T")
     assert v._env_secret() == ""                       # a platform key in the environment is not used while sealing is on
     assert v._dk is None
+
+
+@pytest.mark.skipif(not __import__("os").environ.get("TEST_DATABASE_URL"), reason="needs TEST_DATABASE_URL")
+def test_sealed_vault_creates_then_opens_with_passphrase_only(db, monkeypatch):
+    from apgkit.auth.schema import SQL as AUTH_SQL
+    from apgkit.vault import Vault, VaultLocked, sealed_unlocker
+    monkeypatch.setenv("T_ENCRYPTION_KEY", "z" * 64)
+    s = sl.Sealed(sl.seal({"a": "b"}, PASS))
+    sl.set_active(s)
+    with db.connect() as c:
+        c.execute(AUTH_SQL)
+        c.commit()
+    v = Vault("T")
+    assert v._env_secret() == "" and v._dk is None
+    cb = sealed_unlocker(v, db.connect)
+    cb(s, sl.Protected(PASS))
+    assert v.is_unlocked()
+    token = v.encrypt("hello", context="x")
+    # the vault is stored under the passphrase alone: a platform key never wrapped it
+    v2 = Vault("T")
+    with db.connect() as c:
+        with pytest.raises(VaultLocked):
+            v2.unlock_sealed(c, sl.Protected("a-different-passphrase-of-length"))
+        assert v2.unlock_sealed(c, sl.Protected(PASS)) == "unlocked"
+        assert v2.status(c)["auto_unlock"] is False
+    assert v2.decrypt(token, context="x") == "hello"

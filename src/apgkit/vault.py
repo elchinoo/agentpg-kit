@@ -585,3 +585,13 @@ def legacy_decrypt_fallback(vault: Vault, token: str, context: str, *, reencrypt
     if reencrypt is not None:
         reencrypt(vault.encrypt(plaintext, context))
     return plaintext
+
+
+def sealed_unlocker(vault: Vault, connect: Callable):
+    """The `Sealed.on_unsealed` callback that opens (creating on first start) `vault` with the operator's passphrase:
+    `sealed.on_unsealed(sealed_unlocker(vault, connect))`, where `connect` returns a database connection."""
+    def callback(_sealed, passphrase: Protected) -> None:
+        with connect() as conn:
+            vault.unlock_sealed(conn, passphrase)
+            conn.commit()
+    return callback

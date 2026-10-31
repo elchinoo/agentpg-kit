@@ -310,6 +310,7 @@ class Sealed:
         self._priv: Protected | None = None
         self._pub: str | None = None
         self._ran_ready = False
+        self._event = threading.Event()
 
     @classmethod
     def from_env(cls) -> "Sealed":
@@ -347,17 +348,11 @@ class Sealed:
         return self._secrets.get(name)
 
     def on_unsealed(self, callback: Callback) -> None:
-        """Run `callback(sealed, passphrase)` once the blob is open (immediately when sealing is not enabled or already open). The
-        passphrase is a `Protected`; use it for the vault unlock and let it go. A callback that raises seals the app again."""
+        """Run `callback(sealed, passphrase)` when the blob is opened, before the app starts serving (for work that needs the secrets or
+        the passphrase: unlock the vault). The passphrase is a `Protected`; use it and let it go. A callback that raises seals the app
+        again. When sealing is not enabled the callbacks never run: the app keeps its ordinary start-up."""
         with self._lock:
             self._callbacks.append(callback)
-            run_now = not self.enabled
-        if run_now:
-            dummy = Protected(b"-")
-            try:
-                callback(self, dummy)
-            finally:
-                dummy.wipe()
 
     # the ephemeral key the operator encrypts the passphrase to
     def public_key(self) -> str:
@@ -404,6 +399,7 @@ class Sealed:
                 for cb in list(self._callbacks):
                     cb(self, passphrase)
                 self._ran_ready = True
+                self._event.set()
             except BaseException:                           # fail closed: a callback that cannot finish leaves the app sealed
                 self._reseal()
                 raise
@@ -413,7 +409,42 @@ class Sealed:
                 self._priv.wipe()
                 self._priv, self._pub = None, None
 
+    def wait_unsealed(self, timeout: float | None = None) -> bool:
+        """Block until the app is unsealed (True at once when sealing is not enabled)."""
+        return True if not self.enabled else self._event.wait(timeout)
+
+    def deferred(self, lifespan):
+        """Wrap an ASGI lifespan so its start-up (migrations, background loops that use the database) runs only once the app is
+        unsealed. Sealing off: the lifespan runs as it always did. Sealed: the app serves the unseal routes at once, and the wrapped
+        lifespan starts after the operator unseals it and stops at shutdown."""
+        import asyncio
+        import contextlib
+
+        @contextlib.asynccontextmanager
+        async def wrapper(app):
+            if not self.enabled:
+                async with lifespan(app):
+                    yield
+                return
+            stop = asyncio.Event()
+
+            async def run():
+                while not await asyncio.to_thread(self.wait_unsealed, 1.0):
+                    if stop.is_set():
+                        return
+                async with lifespan(app):
+                    await stop.wait()
+
+            task = asyncio.create_task(run())
+            try:
+                yield
+            finally:
+                stop.set()
+                await asyncio.gather(task, return_exceptions=True)
+        return wrapper
+
     def _reseal(self) -> None:
+        self._event.clear()
         self._unsealed = False
         for item in self._secrets.values():
             item.wipe()
