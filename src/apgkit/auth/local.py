@@ -162,6 +162,14 @@ class LocalAuth:
     def _token_mac(self, row_id, name, token_hash, prefix, scope, revoked: bool) -> str:
         return self.vault.row_mac("api_token", row_id, name, token_hash, prefix, scope, int(revoked))
 
+    def session_mac(self, *args) -> str:
+        """Public form of the session row MAC (token_hash, subject, name, email, roles, source, expires_at): for code that re-signs rows after a data-key rotation."""
+        return self._session_mac(*args)
+
+    def token_mac(self, *args) -> str:
+        """Public form of the API-token row MAC (id, name, token_hash, prefix, scope, revoked)."""
+        return self._token_mac(*args)
+
     def adopt_rows(self, conn) -> dict:
         """One-time upgrade of a deployment that has sessions and tokens written before row MACs: sign every row that has no MAC, trusting
         the table as it is NOW (run it only when you trust the database at this moment). Returns the counts. Needs the vault open."""
