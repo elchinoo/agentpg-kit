@@ -8,6 +8,7 @@
 Federated mode (see oidc.py / rp.py) sits beside this; an app can run either or both.
 """
 import hmac
+import json
 import secrets
 import threading
 from datetime import UTC, datetime, timedelta
@@ -149,6 +150,35 @@ class LocalAuth:
         conn.execute("DELETE FROM web_session")
         conn.commit()
 
+    # ---- row MACs: a database write alone cannot plant a session or a token -------------------------------------
+    def _macs_enforced(self) -> bool:
+        """Rows are signed and checked when the app has a vault that is open. With sealed boot the vault is always open before the
+        app serves. A locked vault outside sealed boot keeps the old behaviour (nothing to check against yet)."""
+        return self.vault is not None and self.vault.is_unlocked()
+
+    def _session_mac(self, token_hash, subject, name, email, roles, source, expires_at) -> str:
+        return self.vault.row_mac("web_session", token_hash, subject, name, email, json.dumps(sorted(roles)), source, int(expires_at.timestamp()))
+
+    def _token_mac(self, row_id, name, token_hash, prefix, scope, revoked: bool) -> str:
+        return self.vault.row_mac("api_token", row_id, name, token_hash, prefix, scope, int(revoked))
+
+    def adopt_rows(self, conn) -> dict:
+        """One-time upgrade of a deployment that has sessions and tokens written before row MACs: sign every row that has no MAC, trusting
+        the table as it is NOW (run it only when you trust the database at this moment). Returns the counts. Needs the vault open."""
+        if not self._macs_enforced():
+            raise ValueError("adopt_rows needs an open vault")
+        n = {"sessions": 0, "tokens": 0}
+        for r in conn.execute("SELECT token_hash, subject, name, email, roles, source, expires_at FROM web_session WHERE mac IS NULL").fetchall():
+            conn.execute("UPDATE web_session SET mac=%s WHERE token_hash=%s", (self._session_mac(
+                r["token_hash"], r["subject"], r["name"], r["email"], r["roles"], r["source"], r["expires_at"]), r["token_hash"]))
+            n["sessions"] += 1
+        for r in conn.execute("SELECT id, name, token_hash, prefix, scope, revoked_at FROM api_token WHERE mac IS NULL").fetchall():
+            conn.execute("UPDATE api_token SET mac=%s WHERE id=%s", (self._token_mac(
+                r["id"], r["name"], r["token_hash"], r["prefix"], r["scope"], r["revoked_at"] is not None), r["id"]))
+            n["tokens"] += 1
+        conn.commit()
+        return n
+
     # ---- sessions -------------------------------------------------------------------------------------------
     def create_session(self, conn, *, subject: str = "local-admin", name: str = "", email: str = "", roles=(), source: str = "local",
                        id_token_hint: str | None = None) -> str:
@@ -156,19 +186,24 @@ class LocalAuth:
         raw = secrets.token_urlsafe(32)
         now = datetime.now(UTC)
         conn.execute("DELETE FROM web_session WHERE expires_at < %s", (now,))
-        conn.execute("INSERT INTO web_session (token_hash, expires_at, subject, name, email, roles, source, id_token_hint) "
-                     "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-                     (sha256(raw), now + timedelta(hours=SESSION_HOURS), subject, name[:120], email[:254], Jsonb(list(roles)), source, id_token_hint))
+        expires, name, email, roles = now + timedelta(hours=SESSION_HOURS), name[:120], email[:254], list(roles)
+        mac = self._session_mac(sha256(raw), subject, name, email, roles, source, expires) if self._macs_enforced() else None
+        conn.execute("INSERT INTO web_session (token_hash, expires_at, subject, name, email, roles, source, id_token_hint, mac) "
+                     "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                     (sha256(raw), expires, subject, name, email, Jsonb(roles), source, id_token_hint, mac))
         conn.commit()
         return raw
 
     def session_principal(self, conn, raw: str | None) -> Principal | None:
         if not raw:
             return None
-        row = conn.execute("SELECT subject, name, email, roles, source FROM web_session WHERE token_hash=%s AND expires_at > now()",
+        row = conn.execute("SELECT subject, name, email, roles, source, expires_at, mac FROM web_session WHERE token_hash=%s AND expires_at > now()",
                            (sha256(raw),)).fetchone()
         if not row:
             return None
+        if self._macs_enforced() and not self.vault.check_row_mac("web_session", row["mac"], sha256(raw), row["subject"], row["name"], row["email"],
+                                                                json.dumps(sorted(row["roles"])), row["source"], int(row["expires_at"].timestamp())):
+            return None                                    # not written by this app (no MAC, or the row was altered): a planted or edited session
         if row["source"] == "local":                      # the local admin is the whole app's operator
             return Principal("session", row["subject"], frozenset({WILDCARD}), name=row["name"] or "admin", source="local")
         roles = frozenset(row["roles"])
@@ -190,6 +225,8 @@ class LocalAuth:
         raw = self.token_prefix + secrets.token_urlsafe(32)
         row = conn.execute("INSERT INTO api_token (name, token_hash, prefix, scope) VALUES (%s,%s,%s,%s) RETURNING id",
                            (name, sha256(raw), raw[:8], scope)).fetchone()
+        if self._macs_enforced():
+            conn.execute("UPDATE api_token SET mac=%s WHERE id=%s", (self._token_mac(row["id"], name, sha256(raw), raw[:8], scope, False), row["id"]))
         conn.commit()
         return row["id"], raw
 
@@ -197,18 +234,25 @@ class LocalAuth:
         return conn.execute("SELECT id, name, prefix, scope, created_at, last_used_at, revoked_at FROM api_token ORDER BY id DESC").fetchall()
 
     def revoke_token(self, conn, token_id: int) -> bool:
-        row = conn.execute("UPDATE api_token SET revoked_at = now() WHERE id=%s AND revoked_at IS NULL RETURNING id", (token_id,)).fetchone()
+        row = conn.execute("UPDATE api_token SET revoked_at = now() WHERE id=%s AND revoked_at IS NULL "
+                           "RETURNING id, name, token_hash, prefix, scope", (token_id,)).fetchone()
+        if row and self._macs_enforced():
+            conn.execute("UPDATE api_token SET mac=%s WHERE id=%s", (self._token_mac(row["id"], row["name"], row["token_hash"], row["prefix"],
+                                                                                     row["scope"], True), row["id"]))
         conn.commit()
         return row is not None
 
     def token_principal(self, conn, raw: str) -> Principal | None:
         if not raw.startswith(self.token_prefix):
             return None
-        row = conn.execute("UPDATE api_token SET last_used_at = now() WHERE token_hash=%s AND revoked_at IS NULL RETURNING id, scope, name",
-                           (sha256(raw),)).fetchone()
-        conn.commit()
+        th = sha256(raw)
+        row = conn.execute("SELECT id, scope, name, prefix, mac FROM api_token WHERE token_hash=%s AND revoked_at IS NULL", (th,)).fetchone()
         if not row:
             return None
+        if self._macs_enforced() and not self.vault.check_row_mac("api_token", row["mac"], row["id"], row["name"], th, row["prefix"], row["scope"], 0):
+            return None                                    # not issued by this app, or edited (scope widened, revocation undone with a copied MAC...)
+        conn.execute("UPDATE api_token SET last_used_at = now() WHERE id=%s", (row["id"],))
+        conn.commit()
         scopes = frozenset({row["scope"]})
         return Principal("token", f"token:{row['id']}", self.app.permissions_for(scopes=scopes), scopes=scopes, name=row["name"],
                          ident=row["id"], source="local")

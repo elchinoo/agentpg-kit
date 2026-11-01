@@ -14,6 +14,7 @@ ALTER TABLE web_session ADD COLUMN IF NOT EXISTS email text NOT NULL DEFAULT '';
 ALTER TABLE web_session ADD COLUMN IF NOT EXISTS roles jsonb NOT NULL DEFAULT '[]';
 ALTER TABLE web_session ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'local';
 ALTER TABLE web_session ADD COLUMN IF NOT EXISTS id_token_hint text;
+ALTER TABLE web_session ADD COLUMN IF NOT EXISTS mac text;
 
 CREATE TABLE IF NOT EXISTS api_token (
     id            bigserial PRIMARY KEY,
@@ -25,6 +26,7 @@ CREATE TABLE IF NOT EXISTS api_token (
     last_used_at  timestamptz,
     revoked_at    timestamptz
 );
+ALTER TABLE api_token ADD COLUMN IF NOT EXISTS mac text;
 
 CREATE TABLE IF NOT EXISTS oidc_login (
     state       text PRIMARY KEY,

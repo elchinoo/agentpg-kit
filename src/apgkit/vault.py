@@ -314,6 +314,9 @@ class Vault:
         key = self._unwrap(conn, password, _K_SALT, _K_PW, _K_KDF_PW)
         if key is None:
             return False
+        held = self._data_key
+        if held is not None and not hmac.compare_digest(held, key):
+            return False                  # a wrap that opens to a different key than the one in memory was planted (or the key was rotated elsewhere): refuse
         with self._lock:
             self._data_key = key
         if not self._is_current(conn, _K_KDF_PW):          # a wrap with older parameters or the legacy format: upgrade it now that the password is in hand
@@ -424,6 +427,18 @@ class Vault:
         if not purpose:
             raise ValueError("purpose is required")
         return _hkdf(self._key(), _INFO_APP + purpose.encode(), length=length)
+
+    # ---- row MACs -----------------------------------------------------------------------------------------------
+    def row_mac(self, table: str, *fields) -> str:
+        """HMAC-SHA256 over `fields` (length-prefixed, so no two field lists collide) under a subkey of the data key bound to `table`.
+        Store it beside the row; a database write that does not know the data key cannot produce a matching value. Raises VaultLocked."""
+        key = self.derive_key("rowmac/" + table)
+        msg = b"".join(len(b).to_bytes(4, "big") + b for b in (str(f).encode() for f in fields))
+        return _b64(hmac.new(key, msg, hashlib.sha256).digest())
+
+    def check_row_mac(self, table: str, stored: str | None, *fields) -> bool:
+        """True when `stored` is the MAC of `fields`. A missing or wrong MAC is False; a locked vault raises VaultLocked."""
+        return bool(stored) and hmac.compare_digest(stored, self.row_mac(table, *fields))
 
     # ---- rotation -----------------------------------------------------------------------------------------------
     def drop_platform_wrap(self, conn) -> None:
