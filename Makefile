@@ -25,6 +25,6 @@ AIDB_CALLBACK_HOST ?= 192.168.65.254
 AIDB_NAME ?= apgkit-aidb-test
 test-aidb:
 	-docker stop $(AIDB_NAME) >/dev/null 2>&1
-	docker run -d --rm --name $(AIDB_NAME) -p 127.0.0.1:$(AIDB_PORT):5432 -e POSTGRES_PASSWORD=kittest $(AIDB_IMAGE) -c aidb.allow_insecure_egress=on >/dev/null
+	docker run -d --rm --name $(AIDB_NAME) -p 127.0.0.1:$(AIDB_PORT):5432 -e POSTGRES_PASSWORD=postgres $(AIDB_IMAGE) -c aidb.allow_insecure_egress=on >/dev/null
 	@for i in $$(seq 1 40); do docker exec $(AIDB_NAME) pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done; sleep 3
-	AIDB_TEST_URL=postgresql://postgres:kittest@127.0.0.1:$(AIDB_PORT)/postgres AIDB_TEST_CALLBACK_HOST=$(AIDB_CALLBACK_HOST) .venv/bin/pytest -q -m aidb; rc=$$?; docker stop $(AIDB_NAME) >/dev/null; exit $$rc
+	AIDB_TEST_URL=postgresql://postgres:postgres@127.0.0.1:$(AIDB_PORT)/postgres AIDB_TEST_CALLBACK_HOST=$(AIDB_CALLBACK_HOST) .venv/bin/pytest -q -m aidb; rc=$$?; docker stop $(AIDB_NAME) >/dev/null; exit $$rc
