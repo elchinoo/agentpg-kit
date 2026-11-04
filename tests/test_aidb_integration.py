@@ -488,3 +488,89 @@ def test_status_report(conn):
     lim = aidb.status(conn)
     assert lim["aidb"]["available"] and not lim["aidb"]["can_read_telemetry"] and "unavailable" in lim["denials"]
     conn.execute("RESET ROLE")
+
+
+# ---- read paths work for an unprivileged runtime role (0.5.1) -------------------------------------------------------------------------
+RT_ROLE, RT_PW = "kit_rt", "kit-rt-throwaway-pw"
+
+
+@pytest.fixture
+def runtime(dsn):
+    """A login role that is a member of aidb_users only, owns nothing and cannot create in the public schema."""
+    with psycopg.connect(dsn, row_factory=dict_row) as c:
+        c.execute(f"DROP OWNED BY {RT_ROLE}") if c.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (RT_ROLE,)).fetchone() else None
+        c.execute(f"DROP ROLE IF EXISTS {RT_ROLE}")
+        c.execute(f"CREATE ROLE {RT_ROLE} LOGIN PASSWORD '{RT_PW}' IN ROLE aidb_users")
+        c.execute(f"REVOKE CREATE ON SCHEMA public FROM PUBLIC, {RT_ROLE}")
+        c.commit()
+    with psycopg.connect(make_conninfo(dsn, user=RT_ROLE, password=RT_PW), row_factory=dict_row) as rc:
+        assert not rc.execute("SELECT has_schema_privilege('public', 'CREATE') AS p").fetchone()["p"]
+        yield rc
+
+
+def _drop_seal_table(conn):
+    conn.execute(f"DROP TABLE IF EXISTS {aidb.SEAL_TABLE}")
+    conn.commit()
+
+
+def test_verify_and_status_work_without_create_and_report_a_missing_seal_table(conn, runtime):
+    vault = Vault("rt")
+    vault._data_key = b"r" * 32
+    _drop_seal_table(conn)
+    conn.execute("DROP TABLE IF EXISTS rt_t CASCADE")
+    conn.execute("CREATE TABLE rt_t (id int)")
+    conn.commit()
+    aidb.ensure_purpose(conn, "rt_p", read=["rt_t"])             # created and not sealed: the seal table does not exist yet
+    mine = lambda drifts: sorted((d.kind, d.name, d.problem) for d in drifts if d.name.startswith("rt_"))   # noqa: E731
+    # no seal table: reported, not raised; and nothing was created by the read path
+    assert not aidb.seal_table_exists(runtime)
+    assert mine(aidb.verify(runtime, vault)) == [("purpose", "rt_p", "unsealed")]
+    assert mine(aidb.verify(runtime, vault, strict=False)) == []
+    assert not aidb.seal_table_exists(conn)
+    assert aidb.status(runtime)["aidb"]["available"]
+    # `expect` and `only` narrow the judgement to the app's own objects
+    assert mine(aidb.verify(runtime, vault, only=lambda k, n: n != "rt_p")) == []
+    # the unprivileged role cannot create the seal table and says so
+    with pytest.raises(aidb.AidbError, match="cannot create it"):
+        aidb.seal(runtime, vault, "purpose", "rt_p")
+    runtime.rollback()
+    # the operator seals (creating the table); the runtime role needs SELECT on it and nothing else
+    aidb.ensure_purpose(conn, "rt_p", read=["rt_t"], vault=vault)
+    assert aidb.seal_table_exists(conn)
+    conn.execute(f"GRANT SELECT ON {aidb.SEAL_TABLE} TO {RT_ROLE}")
+    conn.commit()
+    assert mine(aidb.verify(runtime, vault)) == []                # the table exists: no DDL is issued, no permission error
+    assert mine(aidb.verify(runtime, vault, expect=[("purpose", "rt_p")])) == []
+    # tampering is still seen by the unprivileged verifier
+    conn.execute("SELECT aidb.update_purpose(name => 'rt_p', role => 'pg_read_all_data')")
+    conn.commit()
+    assert ("purpose", "rt_p", "modified") in mine(aidb.verify(runtime, vault))
+    # a deleted seal row is noticed through `expect` even for a kind strict mode does not list
+    conn.execute("SELECT aidb.update_purpose(name => 'rt_p', role => 'aidb_p_rt_p')")
+    conn.execute(f"DELETE FROM {aidb.SEAL_TABLE} WHERE name = 'rt_p'")
+    conn.commit()
+    assert mine(aidb.verify(runtime, vault, expect=[("purpose", "rt_p")])) == [("purpose", "rt_p", "unsealed")]
+    # the operator's seal path tolerates a table that already exists (what an app does on every start)
+    aidb.ensure_purpose(conn, "rt_p", read=["rt_t"], vault=vault, reseal=True)
+    assert mine(aidb.verify(runtime, vault)) == []
+    # a locked vault still raises instead of reporting a clean state, even with no seal table
+    from apgkit.vault import VaultLocked
+    with pytest.raises(VaultLocked):
+        aidb.verify(runtime, Vault("locked"))
+    runtime.rollback()
+
+
+def test_retrieve_and_converse_work_for_an_unprivileged_role(conn, runtime):
+    _docs(conn, "rt_docs")
+    aidb.ensure_pipeline(conn, "rt_docs", source="rt_docs", key_column="id", text_column="body")
+    kb = aidb.kb_for_pipeline(conn, "rt_docs")
+    aidb.ensure_agent(conn, "rt_agent", instructions="Answer briefly.", model="dummy")
+    conn.execute(f"GRANT SELECT ON rt_docs, {kb} TO {RT_ROLE}")        # the knowledge base's vector table is the app's grant to make
+    conn.commit()
+    hits = aidb.retrieve(runtime, kb, "connection pooling for postgres", k=2)
+    assert hits and hits[0]["key"] in {"1", "3"}
+    runtime.rollback()
+    rep = aidb.converse(runtime, "rt_agent", "hello", timeout=30)
+    assert "permission denied for schema" not in (rep.error or "")        # whatever the dummy model answers, no DDL was attempted
+    assert aidb.status(runtime)["aidb"]["available"]
+    runtime.rollback()

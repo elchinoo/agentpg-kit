@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
@@ -226,8 +226,23 @@ def definition(conn: psycopg.Connection, kind: str, name: str) -> list[str] | No
     raise ValueError(f"unknown kind {kind!r}")
 
 
+def seal_table_exists(conn: psycopg.Connection) -> bool:
+    """True when the seal table is visible on the search path. A catalog lookup: no DDL, no privilege needed."""
+    return bool(_one(conn, "SELECT to_regclass(%s) IS NOT NULL AS ok", (SEAL_TABLE,))["ok"])
+
+
 def _seal_table(conn: psycopg.Connection) -> None:
-    conn.execute(SEAL_SQL)
+    """Operator-side (seal/unseal paths): make sure the seal table exists. An existing table is never touched, so a role without
+    CREATE on the schema works once the table is there (Postgres refuses CREATE TABLE IF NOT EXISTS to such a role even then).
+    A missing table that this role cannot create raises AidbError with the way out."""
+    if seal_table_exists(conn):
+        return
+    try:
+        with conn.transaction():
+            conn.execute(SEAL_SQL)
+    except psycopg.errors.InsufficientPrivilege:
+        raise AidbError(f"the seal table {SEAL_TABLE} does not exist and this role cannot create it: run the operator setup once "
+                        "with a role that can (and grant it SELECT to the runtime role)") from None
 
 
 def seal(conn: psycopg.Connection, vault, kind: str, name: str) -> bool:
@@ -243,7 +258,8 @@ def seal(conn: psycopg.Connection, vault, kind: str, name: str) -> bool:
 
 
 def unseal(conn: psycopg.Connection, kind: str, name: str) -> None:
-    _seal_table(conn)
+    if not seal_table_exists(conn):
+        return
     conn.execute("DELETE FROM apgkit_aidb_seal WHERE kind = %s AND name = %s", (kind, name))
 
 
@@ -251,8 +267,8 @@ def _guard(conn: psycopg.Connection, vault, kind: str, name: str, reseal: bool) 
     """Before changing an existing sealed object: refuse when it no longer matches its seal (someone edited it)."""
     if vault is None or reseal:
         return
-    _seal_table(conn)
-    row = _one(conn, "SELECT mac FROM apgkit_aidb_seal WHERE kind = %s AND name = %s", (kind, name))
+    row = (_one(conn, "SELECT mac FROM apgkit_aidb_seal WHERE kind = %s AND name = %s", (kind, name))
+           if seal_table_exists(conn) else None)
     fields = definition(conn, kind, name)
     if row is not None and fields is not None and not vault.check_row_mac(SEAL_TABLE, row["mac"], *fields):
         raise AidbTampered(f"{kind} {name!r} was changed outside the app (its seal does not match); inspect it, then call again "
@@ -273,16 +289,25 @@ class Drift:
     problem: str            # modified | missing | unsealed
 
 
-def verify(conn: psycopg.Connection, vault, *, strict: bool = True, ignore: Sequence[tuple[str, str]] = ()) -> list[Drift]:
+def verify(conn: psycopg.Connection, vault, *, strict: bool = True, ignore: Sequence[tuple[str, str]] = (),
+           only: Callable[[str, str], bool] | None = None, expect: Sequence[tuple[str, str]] = ()) -> list[Drift]:
     """Compare every sealed definition with the catalog. `strict` also reports agents, purposes and SQL tools that carry no seal
-    (planted objects, or a deleted seal row). Empty list = nothing changed behind the app's back. Raises VaultLocked if the vault is locked."""
-    _seal_table(conn)
+    (planted objects, or a deleted seal row). Empty list = nothing changed behind the app's back. Raises VaultLocked if the vault is locked.
+
+    Read-only: it issues no DDL and needs only SELECT on the seal table, so the app's unprivileged runtime role can run it. When the
+    seal table does not exist (nothing sealed yet) every object that strict mode looks at is reported `unsealed`.
+    - `only(kind, name)`: judge just the objects it accepts (a shared database holds other apps' objects).
+    - `expect`: (kind, name) pairs your setup creates; one that exists but carries no seal is reported `unsealed` whatever its kind."""
+    if not vault.is_unlocked():
+        from .vault import VaultLocked
+        raise VaultLocked("the vault is locked: seals cannot be checked")      # never report a clean state it cannot know
     out: list[Drift] = []
     seen: set[tuple[str, str]] = set()
-    for row in _rows(conn, "SELECT kind, name, mac FROM apgkit_aidb_seal ORDER BY kind, name"):
+    rows = (_rows(conn, "SELECT kind, name, mac FROM apgkit_aidb_seal ORDER BY kind, name") if seal_table_exists(conn) else [])
+    for row in rows:
         key = (row["kind"], row["name"])
         seen.add(key)
-        if key in ignore or row["kind"] not in SEAL_KINDS:
+        if key in ignore or row["kind"] not in SEAL_KINDS or (only is not None and not only(*key)):
             continue
         fields = definition(conn, row["kind"], row["name"])
         if fields is None:
@@ -293,8 +318,13 @@ def verify(conn: psycopg.Connection, vault, *, strict: bool = True, ignore: Sequ
         for kind, query in (("agent", "SELECT name FROM aidb.agents"), ("purpose", "SELECT name FROM aidb.purpose_registry WHERE deleted_at IS NULL"),
                             ("sql_tool", "SELECT name FROM aidb.sql_tool_registry")):
             for r in _rows(conn, query):
-                if (kind, r["name"]) not in seen and (kind, r["name"]) not in ignore:
+                key = (kind, r["name"])
+                if key not in seen and key not in ignore and (only is None or only(*key)):
                     out.append(Drift(kind, r["name"], "unsealed"))
+    flagged = {(d.kind, d.name) for d in out}
+    for key in expect:
+        if key not in seen and key not in flagged and key not in ignore and definition(conn, *key) is not None:
+            out.append(Drift(*key, "unsealed"))
     conn.commit()
     return out
 

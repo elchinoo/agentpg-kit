@@ -1,6 +1,6 @@
 # agentpg-kit guide
 
-Version described: **0.5.0** (`apgkit.__version__` is the single source; `pyproject.toml` reads it). Everything below was checked against the
+Version described: **0.5.1** (`apgkit.__version__` is the single source; `pyproject.toml` reads it). Everything below was checked against the
 source in `src/apgkit`, the tests in `tests/`, and the way the other projects of the ecosystem use the kit. Where a statement could
 not be verified it is listed under [Known limitations](#13-known-limitations-and-things-not-verified).
 
@@ -1028,7 +1028,13 @@ definition is MAC-ed under the vault's data key into the table `apgkit_aidb_seal
 `Drift(kind, name, problem)` entries: `modified` (changed by a database write), `missing` (deleted) and, with `strict=True`, `unsealed`
 (an agent, purpose or SQL tool nobody sealed: planted, or its seal row deleted). `ensure_*` refuses to touch a sealed object whose
 current state does not match its seal (`AidbTampered`; pass `reseal=True` after you inspected it), so a tampered definition is never
-silently healed. Call `verify` at start-up (after the vault is open) and on a schedule. All of this was exercised: a rewritten agent
+silently healed. `verify` (and `status`, `retrieve`, `converse`) are read-only and issue no DDL, so the app's unprivileged runtime role can
+run them (since 0.5.1: before that, `verify` began with `CREATE TABLE IF NOT EXISTS`, which Postgres refuses to a role without CREATE on the
+schema even when the table exists, giving `permission denied for schema public`). Only the sealing paths (`seal`, `ensure_*` with `vault=`)
+create the table, they leave an existing table alone, and a role that cannot create a missing one gets an `AidbError` that says so. The
+operator creates the table by sealing once and grants the runtime role `SELECT` on `apgkit_aidb_seal`; until then `verify` reports the
+objects it looks at as `unsealed` instead of failing (`aidb.seal_table_exists(conn)` tells which). `verify(only=fn, expect=[(kind, name)])`
+judges just your own objects in a shared database and flags expected objects whose seal row was deleted. Call `verify` at start-up (after the vault is open) and on a schedule. All of this was exercised: a rewritten agent
 instruction, a repointed purpose, an extra grant on a purpose role, a rewritten SQL tool, a planted agent and a deleted agent are each
 reported.
 
