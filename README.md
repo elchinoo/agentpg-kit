@@ -132,6 +132,9 @@ make test-aidb                                 # the `aidb` tests, in a throwawa
 
 ## Changelog
 
+### 0.5.2
+- Fix: the federated client secret is read at use time. `from_env` used to read `<PREFIX>_OIDC_CLIENT_SECRET` while building the relying party, so under sealed boot (no secret until unseal) an app built at import became a public client and the token exchange returned 401. `RelyingParty` now calls its secret getter at every token exchange (never cached, so a re-seal is honoured). The client type comes from configuration: new `<PREFIX>_OIDC_PUBLIC_CLIENT=true` declares a public client; otherwise, while sealing is enabled and the app is not unsealed, the exchange fails closed with `ClientSecretUnavailable` (a `TokenError`) and sends nothing, instead of downgrading to a public client. With sealing off, or open, behaviour is unchanged (no secret configured means public). Apps no longer need their own lazy-secret wrapper around `RelyingParty` (CityPulse's `_federation`). See GUIDE 5.3 and 7.3.3.
+
 ### 0.5.1
 - Fix: `apgkit.aidb.verify` no longer issues `CREATE TABLE IF NOT EXISTS apgkit_aidb_seal` (Postgres refuses that to a role without CREATE on the schema even when the table exists, so an unprivileged runtime role failed with `permission denied for schema public`). Read paths (`verify`, and the guard inside `ensure_*`, `unseal`) check `to_regclass` first and never run DDL; a missing seal table is reported as `unsealed` objects, not an exception. Only `seal`/`ensure_*` with `vault=` create the table, tolerate an existing one, and raise `AidbError` when a role without CREATE meets a missing one. The runtime role needs `SELECT` on `apgkit_aidb_seal` (operator grants it). New: `aidb.seal_table_exists`, `verify(only=, expect=)` so an app can drop its own copy of the check. Audited: `status`, `retrieve`, `converse`, `detect` and the catalog reads issue no DDL; tests run them as a role that is only in `aidb_users` (GUIDE 7.13).
 

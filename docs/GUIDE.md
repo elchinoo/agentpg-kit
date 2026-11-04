@@ -1,6 +1,6 @@
 # agentpg-kit guide
 
-Version described: **0.5.1** (`apgkit.__version__` is the single source; `pyproject.toml` reads it). Everything below was checked against the
+Version described: **0.5.2** (`apgkit.__version__` is the single source; `pyproject.toml` reads it). Everything below was checked against the
 source in `src/apgkit`, the tests in `tests/`, and the way the other projects of the ecosystem use the kit. Where a statement could
 not be verified it is listed under [Known limitations](#13-known-limitations-and-things-not-verified).
 
@@ -272,7 +272,8 @@ stderr and gives an empty string.
 |---|---|---|---|
 | `<PREFIX>_ENCRYPTION_KEY` (+ `_FILE`) | `/etc/<prefix>/encryption_key` (prefix lower-cased) | `Vault` | The platform secret that wraps the vault data key so the vault unlocks at start without the admin password. Empty: the vault needs the admin password after every restart. |
 | `<PREFIX>_API_KEY` (+ `_FILE`) | `/etc/<prefix>/api_key` | `LocalAuth.static_key` | A full-access static credential for automation. At least 32 characters or it is never accepted (an error is logged); a warning is logged at startup whenever one is enabled. Prefer scoped API tokens. A usable key (32+ characters) also disables the first-run setup flow (`needs_setup` is false, `static_key_usable()` is true); a refused short key does not (`needs_setup` stays true), though `static_key_configured()` is true for any value. |
-| `<PREFIX>_OIDC_CLIENT_SECRET` (+ `_FILE`) | none | `from_env` | The app's confidential-client secret at the identity provider. Empty at start means a **public client** (PKCE only, `client_id` sent in the token request). |
+| `<PREFIX>_OIDC_CLIENT_SECRET` (+ `_FILE`) | none | `from_env` | The app's confidential-client secret at the identity provider. Read when a login needs it (first token exchange), never at import, and never cached (since 0.5.2). Empty means a **public client** (PKCE only, `client_id` sent in the token request), except while sealing is enabled and not unsealed (see `_OIDC_PUBLIC_CLIENT` and 7.3.3). |
+| `<PREFIX>_OIDC_PUBLIC_CLIENT` | `false` | `from_env` | `true` declares a public client on purpose and ignores any secret. It is the only way to stay public while sealed and not yet unsealed (since 0.5.2). |
 
 ### 5.3 Federation (`apgkit.auth.from_env(prefix, default_client_id)`)
 
@@ -594,6 +595,14 @@ removes every start-up secret from those places.
    minute (30 overall) answer 429. A callback that fails (database down, wrong vault passphrase) leaves the app sealed.
 4. **Read secrets as before**: while unsealed, `config.read_secret(name)` and `config.database_url()` return the sealed values first.
    A restart, or `s.seal_again()`, forgets them and the app is sealed again.
+
+5. **Federation under sealed boot (since 0.5.2)**: `from_env` and `RelyingParty` read the OIDC client secret through `read_secret` at the
+   first token exchange, not at import, so an app that builds its relying party at import (ShopFront) still logs in as a confidential
+   client once unsealed; nothing is cached, so `seal_again()` is honoured. While sealing is enabled and the app is not unsealed, a
+   client that is not declared public (`<PREFIX>_OIDC_PUBLIC_CLIENT=true`) fails closed: `finish` raises `ClientSecretUnavailable`
+   and sends no request, rather than silently becoming a public client (which the provider answers with 401, or worse, accepts).
+   Once unsealed, a secret that is configured nowhere means a public client, as in an unsealed deployment. Version 0.5.1 and
+   earlier read the secret at construction; apps worked around it with their own lazy getter, which is no longer needed.
 
 Memory: the vault's data key, the unsealed secrets and the passphrase are `sealed.Protected`: held as `value XOR pad` in two locked,
 dump-excluded pages and re-masked every `APGKIT_REMASK_SECONDS` (default 15), revealed only inside `with p.reveal() as buf` (zeroed

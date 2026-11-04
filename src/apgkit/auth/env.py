@@ -2,7 +2,11 @@
 
     <PREFIX>_OIDC_ISSUER          the ecosystem identity provider's URL (federation is off when unset)
     <PREFIX>_OIDC_CLIENT_ID       this app's client id at the provider (default: the app name)
-    <PREFIX>_OIDC_CLIENT_SECRET   its secret (or <PREFIX>_OIDC_CLIENT_SECRET_FILE); empty means a public client (PKCE only)
+    <PREFIX>_OIDC_CLIENT_SECRET   its secret (or <PREFIX>_OIDC_CLIENT_SECRET_FILE), read when a login needs it (first token exchange),
+                                  never at import: with sealed boot it does not exist until unseal. Empty (and sealing off or open)
+                                  means a public client (PKCE only)
+    <PREFIX>_OIDC_PUBLIC_CLIENT   true declares a public client on purpose; it is the only way to stay public while sealed and not yet
+                                  unsealed (otherwise token exchange fails closed until the secret is readable)
     <PREFIX>_LOCAL_LOGIN          keep the local admin password as a break-glass login (default true)
 """
 import os
@@ -33,6 +37,7 @@ def from_env(prefix: str, default_client_id: str) -> Federation:
     local_login = env_bool(f"{prefix}_LOCAL_LOGIN", True)
     if not issuer:
         return Federation("", client_id, None, None, True)
-    secret = lambda: read_secret(f"{prefix}_OIDC_CLIENT_SECRET")  # noqa: E731
-    return Federation(issuer.rstrip("/"), client_id, TokenVerifier(issuer, client_id, ttl=jwks_ttl_from_env(prefix)), RelyingParty(issuer, client_id, secret if secret() else None),
+    # The client type comes from configuration, never from whether the secret happens to be readable right now.
+    secret = None if env_bool(f"{prefix}_OIDC_PUBLIC_CLIENT", False) else (lambda: read_secret(f"{prefix}_OIDC_CLIENT_SECRET"))
+    return Federation(issuer.rstrip("/"), client_id, TokenVerifier(issuer, client_id, ttl=jwks_ttl_from_env(prefix)), RelyingParty(issuer, client_id, secret),
                       local_login)

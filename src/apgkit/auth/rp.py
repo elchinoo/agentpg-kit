@@ -51,7 +51,21 @@ def clear_binding(response, cookie_name: str = BINDING_COOKIE, *, secure: bool =
     response.delete_cookie(cookie_name, path="/", httponly=True, secure=secure, samesite="lax")
 
 
+class ClientSecretUnavailable(TokenError):
+    """The client is configured as confidential, sealing is on and not open: refuse rather than fall back to a public client."""
+
+
+def _sealing_pending() -> bool:
+    from .. import sealed
+    s = sealed.active()
+    return s is not None and s.enabled and not s.unsealed
+
+
 class RelyingParty:
+    """`client_secret` is a getter called at every token exchange (never cached, so a re-seal is honoured), or None for a client
+    declared public. A getter that returns '' means no secret is configured: a public client, except while sealing is enabled and
+    the app is not unsealed, when the exchange fails closed (`ClientSecretUnavailable`) instead of silently downgrading."""
+
     def __init__(self, issuer: str, client_id: str, client_secret: Callable[[], str] | None = None, *,
                  http: Callable[[], httpx.Client] = _client_factory, scopes: str = SCOPES):
         self.issuer, self.client_id, self._secret, self._http, self.scopes = check_issuer_url(issuer), client_id, client_secret, http, scopes
@@ -81,6 +95,7 @@ class RelyingParty:
     def finish(self, conn, redirect_uri: str, code: str, state: str, binding: str | None) -> tuple[dict, str, str]:
         """Returns (id_token claims, return_to, raw id_token). `binding` is the browser's binding cookie (None when absent).
         Raises TokenError for anything wrong. The state is consumed even when the binding is wrong (single use)."""
+        auth, client_id_field = self._client_auth()
         row = conn.execute("DELETE FROM oidc_login WHERE state=%s AND created_at > now() - %s * interval '1 minute' "
                            "RETURNING verifier, nonce, return_to, binding_hash", (state, STATE_TTL_MINUTES)).fetchone()
         conn.commit()
@@ -92,12 +107,7 @@ class RelyingParty:
                 or not hmac.compare_digest(stored.encode(), expected.encode()):
             raise TokenError("this login was not started in this browser; start again")
         data = {"grant_type": "authorization_code", "code": code, "redirect_uri": redirect_uri, "code_verifier": row["verifier"]}
-        auth = None
-        secret = self._secret() if self._secret else ""
-        if secret:
-            auth = (self.client_id, secret)
-        else:
-            data["client_id"] = self.client_id
+        data.update(client_id_field)
         with self._http() as c:
             r = c.post(self.conf()["token_endpoint"], data=data, auth=auth)
         if r.status_code != 200:
@@ -110,6 +120,17 @@ class RelyingParty:
         if not isinstance(claims.get("nonce"), str) or not hmac.compare_digest(claims["nonce"].encode(), str(row["nonce"]).encode()):
             raise TokenError("the ID token does not belong to this login attempt")
         return claims, row["return_to"], id_token
+
+    def _client_auth(self) -> tuple[tuple[str, str] | None, dict]:
+        """(basic auth, extra form fields) for the token request, decided now, at use time."""
+        if self._secret is None:
+            return None, {"client_id": self.client_id}
+        secret = self._secret()
+        if secret:
+            return (self.client_id, secret), {}
+        if _sealing_pending():
+            raise ClientSecretUnavailable("the client secret is not available yet (the app is sealed); unseal it and sign in again")
+        return None, {"client_id": self.client_id}
 
     def logout_url(self, id_token_hint: str | None, post_logout_redirect: str) -> str | None:
         end = self.conf().get("end_session_endpoint")
