@@ -24,6 +24,19 @@ def pytest_sessionstart(session):
                     returncode=2)
 
 
+AIDB_URL = os.environ.get("AIDB_TEST_URL", "")
+
+
+def pytest_collection_modifyitems(config, items):
+    """Tests marked `aidb` need a Postgres with AIDB (image aidb-postgres:17): they run only when AIDB_TEST_URL is set."""
+    if AIDB_URL:
+        return
+    skip = pytest.mark.skip(reason="set AIDB_TEST_URL (a superuser DSN of a Postgres with AIDB) to run the aidb tests")
+    for item in items:
+        if "aidb" in item.keywords:
+            item.add_marker(skip)
+
+
 needs_db = pytest.mark.skipif(not TEST_URL, reason="set TEST_DATABASE_URL to run database tests")
 
 

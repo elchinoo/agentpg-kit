@@ -1,6 +1,6 @@
 # agentpg-kit guide
 
-Version described: **0.4.1** (`apgkit.__version__` is the single source; `pyproject.toml` reads it). Everything below was checked against the
+Version described: **0.5.0** (`apgkit.__version__` is the single source; `pyproject.toml` reads it). Everything below was checked against the
 source in `src/apgkit`, the tests in `tests/`, and the way the other projects of the ecosystem use the kit. Where a statement could
 not be verified it is listed under [Known limitations](#13-known-limitations-and-things-not-verified).
 
@@ -31,7 +31,7 @@ Who it is for:
 - Security reviewers: the security-critical code of every app (password hashing, vault, SSRF guard, token verification, CSRF/CSP
   middleware) lives here once. See [SECURITY.md](../SECURITY.md).
 
-What it is not: an ORM, a web framework, an MCP server framework (see limitations), or a vector/retrieval layer.
+What it is not: an ORM, a web framework, an MCP server framework (see limitations), or a vector database. Since 0.5.0 it does include a thin AIDB layer and a retrieval backend switch (section 7.13).
 
 ## 2. How the kit fits the ecosystem
 
@@ -872,6 +872,189 @@ uvicorn.run(app, host=host, port=port, proxy_headers=True, forwarded_allow_ips=o
 `request.client` from a header any caller can set. If uvicorn rewrites `request.client` from a trusted proxy, `<PREFIX>_TRUSTED_HOPS=0`
 reads that already-resolved address instead of counting again.
 
+### 7.13 The AIDB layer (`apgkit.aidb`, `apgkit.retrieval`; since 0.5.0)
+
+EDB AI Accelerator (AIDB) puts pipelines, knowledge bases, agents, governance (purposes) and telemetry inside Postgres. The kit gives
+every app a thin, tested way to adopt it, and keeps every app runnable on plain Postgres. **Verified against AIDB 7.9.0 in the
+Docker image `aidb-postgres:17`; not against an AgentPG-hosted instance** (the platform's login role did not hold the AIDB grants when
+this was written; see section 12). Preview features (agent memory) are not used.
+
+**Two modules, two jobs.**
+
+- `apgkit.aidb`: detect AIDB; register models and credentials; keep a knowledge base live over an app table; retrieve; confine agents with
+  purposes; register SQL tools; run agents; report health; seal definitions.
+- `apgkit.retrieval`: one interface (`retriever.retrieve(conn, query, k, filters=, hybrid=)` returning `list[Hit]`), two backends
+  (`AppRetrieval`, `AidbRetrieval`) and `select(prefix, ...)`, which reads `<PREFIX>_RETRIEVAL_BACKEND=app|aidb` (default `app`).
+
+**Conventions.** Helpers take a psycopg connection (dict rows or tuple rows). `ensure_*` helpers read the catalog first, change only
+what differs and return `"created"`, `"updated"` or `"unchanged"`; they commit at the end (`commit=False` to leave that to you). A
+definition that AIDB cannot change in place (a model, a pipeline's source or model, a SQL tool when `replace=False`) raises
+`AidbConflict` unless you pass `replace=True`. Every SQL value is a bind parameter and every identifier is quoted with `psycopg.sql`;
+names you choose (pipelines, tools, agents, purposes, roles) must match `[a-z_][a-z0-9_]{0,62}` (`ValueError` otherwise).
+
+#### Detect without failing
+
+```python
+from apgkit import aidb
+st = aidb.detect(conn)          # Status(available, installed, installable, version, pgvector, can_use, can_govern,
+                                #        can_read_telemetry, can_create_roles, otel_client, reason)
+if not st.available:
+    log.info("AIDB off: %s", st.reason)     # plain Postgres: "the aidb extension is not installed on this server"
+aidb.require(conn, min_version="7.7")       # raises AidbUnavailable instead
+```
+
+`detect` never raises for a missing extension or privilege and leaves the connection usable. `can_use` means USAGE on schema `aidb` and
+EXECUTE on its functions (`GRANT aidb_users TO <role>`); governance (purposes, decision records) needs `aidb_governance` (7.7 or later).
+
+#### Models and the gateway (key never logged)
+
+```python
+aidb.ensure_gateway_model(conn, "gw_embed", kind="embeddings", model="text-embedding-3-small", base_url=os.environ["LLM_BASE_URL"])
+aidb.ensure_gateway_model(conn, "gw_chat", kind="chat", model="chat-default", base_url=os.environ["LLM_BASE_URL"])
+```
+
+Registers an OpenAI-compatible model that points at the llm-gateway (`<base_url>/embeddings`, `<base_url>/chat/completions`) with a
+credential `llm_gateway` created through `aidb.create_credential`. The key is `read_secret("LLM_API_KEY")` (so sealed boot and `_FILE`
+work), sent as a bind parameter, and limited to the gateway's host through the credential's endpoint pattern; the credential is private to
+the creating role (`share=False`). No catalog view returns the key (tested), and it did not appear in `aidb_otel` spans or logs (tested,
+telemetry on). Errors are scrubbed of the value. AIDB cannot read a stored secret back, so an existing credential keeps its key until
+you call with `rotate=True` (a changed environment variable alone changes nothing). `ensure_credential` and `ensure_model` are the
+building blocks (`ensure_model(conn, name, provider, config_helper="embeddings_config", config={...})`, or plain JSON `config` for
+local providers such as `llamacpp_reranking`).
+
+Things to know, measured on 7.9.0: AIDB insists on **https** for outbound model calls (plain http only to loopback and private
+addresses and only when the server sets the superuser option `aidb.allow_insecure_egress=on`; the tests use that); by default
+`create_model` calls the endpoint to validate it (`validate=False` skips that); the chat model uses the `openai_completions` provider, for
+which AIDB *simulates* tool calling in the prompt text (the gateway does not serve the Responses API; Responses and Anthropic native
+providers bypass the gateway).
+
+#### Pipelines and knowledge bases (live)
+
+```python
+info = aidb.ensure_pipeline(conn, "policy", source="policy_chunk", key_column="id", text_column="body",
+                            model=aidb.LOCAL_EMBEDDING_MODEL, distance="Cosine", chunk={"desired_length": 500, "overlap_length": 50})
+info.kb          # "public.pipeline_policy": the knowledge base identifier to retrieve from (never the deprecated pipeline name)
+```
+
+Creates the pipeline in `Live` mode (the database embeds new and changed rows by itself; verified: a row inserted afterwards is
+retrievable within seconds with no app code), embeds the existing rows once, and returns the KB identifier. Repeating the call changes
+nothing; a different source, column, model, distance or chunking is an `AidbConflict` (or rebuilds with `replace=True`, which deletes the
+knowledge base). `refresh_pipeline` processes whatever is waiting, `drop_pipeline` removes pipeline and KB, `pipeline_status` reports mode,
+`lag` (rows waiting), source and embedded counts, status and error counts. The default model is AIDB's local `bge-small-en-v1.5-f16`
+(384 dimensions, no key; downloaded from Hugging Face on first use). A knowledge base created from a different model has a different
+vector size, so a switch of embedding model is a rebuild.
+
+#### Retrieve
+
+```python
+aidb.retrieve(conn, info.kb, "how do we rotate keys?", k=5, filters={"tenant": "acme"}, hybrid=True, rerank_model="")
+```
+
+Plain calls use `aidb.retrieve_text`. `filters` ({source column: value | [values] | None}) and `hybrid=True` use AIDB's own hybrid-search
+pattern (documented by EDB): the KB's vector table joined to the source table with the filter applied at the vector query level
+(`hnsw.iterative_scan = relaxed_order`), and, for `hybrid`, reciprocal-rank fusion with PostgreSQL full-text search over the source text
+column (computed on the fly; add your own `tsvector` index for large tables). `rerank_model` names a registered reranking model
+(`llamacpp_reranking`, `nim_reranking`): the top 3k candidates are reordered with `aidb.rerank_text` (verified with
+`bge-reranker-v2-m3` when `AIDB_TEST_RERANK=1`). Filters and hybrid need a table source (not a volume).
+
+#### The retrieval backend switch
+
+```python
+from apgkit import retrieval
+app = retrieval.AppRetrieval("policy_chunk", key_column="id", text_column="body",
+                             embedding_column="embedding", embedder=my_embed)       # my_embed(text) -> list[float]; optional
+retriever = retrieval.select("TRUSTDESK", app=app, aidb=retrieval.AidbRetrieval(info.kb), connect=db.connect)
+hits = retriever.retrieve(conn, "how do we rotate keys?", k=5, filters={"status": "approved"}, hybrid=True)
+hits[0].key, hits[0].text, hits[0].score, hits[0].distance, hits[0].backend
+```
+
+`Hit(key: str, text, score, distance, backend)` is identical for both backends, so an app swaps with one line. `select` reads
+`<PREFIX>_RETRIEVAL_BACKEND` (`app` default). Asking for `aidb` where it cannot work (plain Postgres, no grant, KB missing, no KB
+configured, database down) logs an ERROR beginning `RETRIEVAL BACKEND FALLBACK`, naming the reason, and returns the `app` backend. Call it at
+start-up, after `ensure_pipeline`. Scores are comparable within one backend and call, not across backends.
+
+The kit contained no retrieval code before this release, so `AppRetrieval` is the generic form of what the fleet apps do: pgvector
+(`<=>`, `<->` or `<#>`) over `embedding_column` using your `embedder`, and PostgreSQL full-text search (terms OR-ed, stemmed with
+`fts_config`, ranked by `ts_rank_cd`) over `text_column`. Without an embedder, or when it fails (logged as a warning), the keyword leg
+answers alone. `hybrid=True` fuses both legs. Existing apps keep their own code until they choose to route calls through this class.
+Parity, measured: for an obvious query the app vector, app keyword, AIDB, AIDB hybrid and app hybrid paths return the same top key, and
+the two vector paths return the same top three with distances within 0.02.
+
+#### Governance: purposes and least-privilege roles
+
+```python
+aidb.enable_telemetry(conn)                     # ALTER DATABASE ... SET aidb.otel_client = 'database' (decision records)
+aidb.ensure_purpose(conn, "support", read=["ticket", "kb_article"], members=["app_role"], description="Support agent")
+aidb.ensure_sql_tool(conn, "open_tickets", description="Open tickets for a customer",
+                     sql_statement="SELECT id, subject FROM ticket WHERE customer_id = ${customer_id} AND status = 'open'",
+                     params={"customer_id": ("INT", "Customer id")})
+aidb.ensure_agent(conn, "support_agent", instructions="...", model="gw_chat", tools=["open_tickets"], purpose="support", timeout=120)
+reply = aidb.converse(conn, "support_agent", "What is open for customer 7?", timeout=90)    # AgentReply(message, conversation_id, error, timed_out)
+aidb.decisions(conn)                            # denials in the last 24 h from aidb_otel.traces
+```
+
+`ensure_purpose` creates a **NOLOGIN role per purpose** (`aidb_p_<purpose>`: no superuser, createdb, createrole, replication or RLS
+bypass) holding exactly the listed grants: SELECT on `read` relations, SELECT/INSERT/UPDATE on `write` relations (tables or views). A repeat
+run converges: grants no longer listed are revoked, and a repeat with the same list reports nothing changed. It grants the role to
+`members` (default: the connecting role), because AIDB requires the caller of `agent_converse` to be a member of the purpose's role, and
+registers the purpose (`aidb.create_purpose`; a retired purpose is revived). Custom SQL tools need no other grants; `native_tools=[...]`
+adds USAGE on schema `aidb`, EXECUTE on those tools and the `aidb_otel` write grants the documentation requires. Creating the role needs
+CREATEROLE; registering a purpose needs `aidb_governance`.
+
+**Give every agent a purpose.** An agent without one runs its tools as whoever calls it. A purpose that is retired or points at a missing role
+refuses the call (it never falls back to the caller). `MCP` tools and `aidb.run_tool` are not confined by purposes.
+
+What really lands (verified on 7.9.0 with telemetry on): an agent calls a tool that reads a table its purpose role was not granted;
+Postgres refuses; the model is shown `Tool error: permission denied for table ... [decision_id=...]` and the `agent_converse` row carries
+no error. `aidb_otel.traces` then holds one `purpose_decision` span with `decision_status = 'denied'`, `source = 'internal'`, `agent_name`,
+`principal` (the calling role), and attributes `aidb.agent.decision.agent_role`, `...denial_reason = engine_privilege_denied`,
+`...denial_class = object_privilege`, `...referenced_relations`, `db.response.status_code = 42501`, and `db.query.text` (the attempted
+SQL). A granted call records `allowed`. `aidb_otel.logs` was empty for the denial. `decisions(conn, status="denied"|"allowed", since="24 hours")`
+returns these as dicts (needs SELECT on `aidb_otel.traces`, i.e. `aidb_governance`); `status()` counts them. Decisions exist only if
+`aidb.otel_client = 'database'` was in force when the session made its first AIDB call, so use `enable_telemetry` (sets it on the
+database for new sessions); other AIDB spans (`create_agent`, `invoke_tool`, `agent_converse`, ...) are recorded too, and the
+`aidb_otel` tables grow until you enable AIDB's retention worker.
+
+`converse` returns an `AgentReply` and never raises for an agent-logic failure (AIDB reports it in `error`). `timeout` is a wall-clock
+bound (`statement_timeout`): on expiry the transaction is rolled back and `timed_out=True`. **Measured caveat:** AIDB notices the
+cancellation only when the in-flight model request returns, so the call ends after the model's reply time rather than exactly at the
+timeout; set the agent's own `timeout` and token budgets as well.
+
+#### Sealing authority-bearing definitions (row-MAC pattern)
+
+Models, credentials (host restriction), pipelines (source, model), purposes (role **and the role's grants**), SQL tools and agents decide
+what data is read, which model or endpoint receives it and what a tool may touch. Pass `vault=` to the `ensure_*` helpers and each
+definition is MAC-ed under the vault's data key into the table `apgkit_aidb_seal` (`Vault.row_mac`); `aidb.verify(conn, vault)` returns
+`Drift(kind, name, problem)` entries: `modified` (changed by a database write), `missing` (deleted) and, with `strict=True`, `unsealed`
+(an agent, purpose or SQL tool nobody sealed: planted, or its seal row deleted). `ensure_*` refuses to touch a sealed object whose
+current state does not match its seal (`AidbTampered`; pass `reseal=True` after you inspected it), so a tampered definition is never
+silently healed. Call `verify` at start-up (after the vault is open) and on a schedule. All of this was exercised: a rewritten agent
+instruction, a repointed purpose, an extra grant on a purpose role, a rewritten SQL tool, a planted agent and a deleted agent are each
+reported.
+
+**Honest limits.** This detects; it does not prevent. A database superuser or the owner of the `aidb` objects can still change them, and
+the check runs only when you run it. It does not cover AIDB's own code, server settings (`aidb.otel_client`, egress options), row-level
+security, pipeline `Live` state, conversation history, or the contents of the source tables; a copy of an older authentic definition (from a
+backup) can be replayed; an app with no vault (CityPulse) has no key to seal with. A credential's secret cannot be MAC-ed (AIDB never returns
+it), only its host restriction, owner-visible flags and existence.
+
+#### Health
+
+`aidb.status(conn)` returns one JSON-able report: `aidb` (the detection), `pipelines` (with lag), `knowledge_bases` (embedding counts, model),
+`models`, `agents`, `purposes`, `telemetry`, `denials` (count and the ten most recent in the window) and `problems` (a pipeline with lag,
+record or blocking errors, a pipeline not `Live`, decisions not being recorded). On plain Postgres it is `{"aidb": {"available": false,
+"reason": ...}, "problems": []}`. A section the role cannot read comes back as `{"unavailable": reason}`.
+
+#### Running the AIDB tests
+
+`make test-aidb` starts a throwaway container from `aidb-postgres:17` (built from the ecosystem repository: `docker/aidb-postgres`,
+needs the EDB repository token as a BuildKit secret), runs `pytest -m aidb` against it and stops it. Without `AIDB_TEST_URL` every `aidb`
+test skips (that is what CI does: no AIDB image, no token). Tests that make AIDB call back into the test process (the scripted chat model
+and the gateway credential) need `AIDB_TEST_CALLBACK_HOST`, an address of the machine the container can reach (Docker Desktop:
+`192.168.65.254`), and a server started with `-c aidb.allow_insecure_egress=on`. The agent tests use the built-in `dummy` model and a
+scripted OpenAI-compatible server (`tests/aidbfake.py`) that returns the tool-call JSON AIDB expects; **a real chat model was not run**
+(it needs the gateway and keys), so how well a real model follows AIDB's simulated tool-calling format is not verified here.
+
 ## 8. Roles, scopes and permissions
 
 The kit has no fixed roles. Each app declares its own; the kit supplies the machinery.
@@ -1029,10 +1212,12 @@ export TEST_DATABASE_URL=postgresql://...      # throwaway database; tests drop 
 | `tests/test_insights.py` | insights with fakes shaped like `edb_stat_monitor`, `query_advisor_qualstats` and `edb_pg_tuner` (aggregation, filtering, truncation, no plan/IP/user leak, parsing, advisor dropped-column and already-indexed suppression against a real `pg_index`), nothing installed, unreadable source via a real unprivileged role, metrics collector; `pg_stat_statements` only if loaded (else skipped) |
 | `tests/test_masking.py` | real roles `a1p_readonly` and a login member: base table denied, masked view allowed, writes refused, idempotent re-run, view column changes, after-migrate hook re-masks, missing role skipped, non-owner reported, `describe`/`unmask`, input validation |
 | `tests/test_oidc.py` | `TokenVerifier` (valid, audience list, bad claims, wrong key, `alg=none` and HMAC confusion, key rotation, refresh rate limit, discovery issuer check), `principal_from_claims`, `TokenSource` caching, `safe_return_to`, full PKCE login flow including single-use state, public client, `Authenticator` with every credential kind, rate limiting |
+| `tests/test_aidb_unit.py` | AIDB layer without AIDB: name validation, RRF, span parsing, backend selection and the loud fallback, `AppRetrieval` keyword/vector/hybrid/filters and embedder failure on plain Postgres, detection on plain Postgres (needs `TEST_DATABASE_URL`) |
+| `tests/test_aidb_integration.py` | marker `aidb`, only with `AIDB_TEST_URL`: detection, idempotent live pipelines, a row appearing in retrieve, filters/hybrid/rerank, backend parity, gateway credential and model (key checked against catalogs and telemetry), agents with the dummy model and a scripted model, call timeout, purpose roles converging, a denial visible in `aidb_otel.traces`, sealing and drift, status |
 | `tests/test_ui.py` | runs each `tests/ui/*.mjs` under node (skipped without node); asserts no `innerHTML`-style APIs and no native dialogs in shared JS; asserts every kit-rendered control has an accessible name |
 | `tests/ui/*.mjs` | fake-DOM scripts: confirm/prompt dialogs, dialog inside another modal, loading/error states, login card, contrast of badge tokens (WCAG AA), `scrollRegion` |
 
-CI (`.github/workflows/test.yml`): Ubuntu, Python 3.12, a `pgvector/pgvector:pg17` service, `pip install -e ".[dev]"`, ruff, pytest.
+CI (`.github/workflows/test.yml`): Ubuntu, Python 3.12, a `pgvector/pgvector:pg17` service, `pip install -e ".[dev]"`, ruff, pytest. The `aidb` tests skip there (no AIDB image, no token); run them locally with `make test-aidb` (section 7.13).
 
 Release routine (from the repository history and the fleet's Dockerfiles): bump `__version__` in
 `src/apgkit/__init__.py` (the single source; `pyproject.toml` reads it), add a README changelog entry, tag `vX.Y.Z`; then each app moves
@@ -1051,16 +1236,23 @@ Adding to the shared UI: no `innerHTML`, no native dialogs, give every control a
   paused or waking up"; the setup screen's hint names `agentpg sandbox logs <sandbox-id>`.
 - **TLS in front of the sandbox**: `web.is_https` and `public_url` honour `X-Forwarded-Proto`.
 - **pgvector**: `Database(vector=True)` registers the adapter; `migrate.run(extensions=("vector",))` creates the extension (the apps use
-  `vector` and `pg_trgm`). The kit contains no embedding, chunking or retrieval code.
+  `vector` and `pg_trgm`). Retrieval over such a table: `retrieval.AppRetrieval` (since 0.5.0, section 7.13); the kit still has no
+  chunking or embedding code of its own.
 - **LLM access through the gateway**: `LLMClient` speaks the OpenAI-compatible `/chat/completions` surface, which is what the
   ecosystem's llm-gateway serves; apps send the gateway's `lg_` key as `LLM_API_KEY`.
 
-**AIDB**: nothing in this repository references AIDB (a search of `src`, `tests` and the README finds no occurrence). The design in
-`ecosystem/docs/03-aidb-integration.md` (a design, not an implementation, written 2026-10-25) proposes for the kit: **a retrieval backend
-interface with two implementations, `app` (the apps' current code) and `aidb`, chosen with one setting**, so every app stays runnable
-on plain Postgres and the before/after comparison is a toggle. It is listed as step 5 of that plan, to be extracted after the
-TrustDesk migration. That document also records, as of 2026-10-25, that AIDB 7.8.0 installs on an AgentPG instance but the instance's login
-role lacks the `aidb_users` grant, which blocks any use until the platform changes it. Treat all of this as **planned, not built**.
+**AIDB (since 0.5.0, section 7.13)**: `apgkit.aidb` detects AIDB, registers models against the gateway (credential through
+`aidb.create_credential`, key from `read_secret`), keeps Live pipelines and knowledge bases over app tables, retrieves (filters, hybrid,
+rerank), creates a least-privilege role per purpose, registers SQL tools and agents, wraps `agent_converse` with a timeout, reports health
+and seals authority-bearing definitions with the vault's row MAC. `apgkit.retrieval` offers one result shape for the `app` and `aidb`
+backends and `<PREFIX>_RETRIEVAL_BACKEND=app|aidb` (default `app`; falls back loudly when AIDB is unavailable). All of it was run
+against AIDB 7.9.0 in the Docker image `aidb-postgres:17`, and every `aidb` test skips cleanly without `AIDB_TEST_URL`.
+
+**Not verified:** an AgentPG-hosted instance (as of 2026-10-25 the platform's login role lacked the `aidb_users` grant, which blocks any
+use; re-check before relying on it), the real llm-gateway over https (the tests use a scripted plain-http server on a private address
+with `aidb.allow_insecure_egress=on`), a real chat model driving an agent's tool calls, native tool calling (needs the Responses or
+Anthropic providers, which bypass the gateway), AIDB's MCP endpoint, and agent memory (preview). The apps have not been migrated to the
+backend switch yet.
 
 ## 13. Known limitations and things not verified
 
@@ -1084,6 +1276,9 @@ Limitations of the kit (verified in code):
 - **`edb_pg_tuner_global_stats()` and `edb_pg_tuner_query_stats()`** have no declared column names; the kit returns the former as
   the dict the cursor describes and does not wrap the latter. `query_advisor_index_recommendations()` is not used (its columns are undeclared too).
 - **Kit `Federation.local_login` is advisory**; the app must enforce it.
+- **AIDB layer** (7.13): `converse(timeout=)` ends when AIDB's in-flight model request returns, not exactly at the timeout; sealing
+  detects edits, it does not prevent them and does not cover AIDB internals or a credential's secret; `AppRetrieval` is generic and
+  unproven against any fleet app's real schema until an app adopts it; hybrid search computes `to_tsvector` on the fly.
 - **`LLMClient` has chat only**; its retries multiply load on a metered gateway.
 - Fleet apps pin `>=0.2.5` but only the Dockerfile tag pins an exact version.
 

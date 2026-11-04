@@ -31,6 +31,7 @@ packages = ["src/apgkit"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["aidb: needs a Postgres with the AIDB extension (set AIDB_TEST_URL); skipped otherwise"]
 
 [tool.ruff]
 line-length = 110
